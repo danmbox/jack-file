@@ -29,7 +29,7 @@ TMP_WILD := $(TMP_WILD) *~ *.bak cscope.*
 TMP_PAT  := $(subst *,%,$(TMP_WILD))
 
 RELEASE  := $(shell tr -d '"' < csrc/release.h)
-MYNAME   := sintvert
+MYNAME   := jack-file
 DISTNAME := $(MYNAME)-$(RELEASE)
 
 PROGS := file2jack jacktransportloop

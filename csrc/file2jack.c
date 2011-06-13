@@ -39,7 +39,7 @@ float cache_secs = 0.0;
 
 // internal vars
 sigset_t sigmask;
-pthread_t poll_thread_tid = 0; int poll_thread_started = 0;
+pthread_t poll_thread_tid;
 pthread_t main_tid;
 jack_nframes_t srate = 0;  ///< Sampling rate
 jack_client_t *jclient = NULL;
@@ -348,10 +348,7 @@ static void cleanup () {
   int z = 0;
   if (0 == sem_getvalue (&zombified, &z) && z > 0)
     TRACE (TRACE_FATAL, "Jack shut us down");
-  if (poll_thread_started) {
-    pthread_cancel (poll_thread_tid);
-    pthread_join (poll_thread_tid, NULL);
-  }
+  pthread_cancel_and_join_if_started (poll_thread_tid, main_tid);
   if (jclient != NULL) {
     if (z == 0) sem_post (&zombified);  // main already knows about it, signal others
     jack_client_close (jclient);
@@ -398,6 +395,7 @@ static void sig_handler (int sig) {
 /// Postcondition: all globals must be in a defined state.
 static void init_globals () {
   main_tid = pthread_self ();
+  poll_thread_tid = main_tid;
   ENSURE_SYSCALL (sigemptyset, (&sigmask));
   ENSURE_SYSCALL (sem_init, (&zombified, 0, 0));
 }
@@ -417,7 +415,7 @@ int main (int argc, char **argv) {
   parse_args (argv);
 
   ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
-  pthread_create (&poll_thread_tid, NULL, poll_thread, NULL);
+  ENSURE_SYSCALL (pthread_create, (&poll_thread_tid, NULL, poll_thread, NULL));
   ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
 
   setup_input_files ();

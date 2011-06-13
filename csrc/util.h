@@ -40,5 +40,15 @@ static int setup_sigs (void (*sig_handler) (int), sigset_t *sigmask, unsigned n,
   return 1;
 }
 
+static void *pthread_cancel_and_join_if_started (pthread_t tid, pthread_t none) {
+  void *ret;
+  if (pthread_equal (tid, none))
+    return NULL;
+  else {
+    pthread_cancel (tid);
+    if (-1 != pthread_join (tid, &ret)) return ret;
+    else return NULL;
+  }
+}
 
 #endif  // __JACKFILE__UTIL_H

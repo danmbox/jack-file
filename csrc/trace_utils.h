@@ -10,18 +10,21 @@ static void myabort () {
 
 #define ASSERT( cond ) TRACE_ASSERT (cond, myabort ());
 
-#define ENSURE_SYSCALL( syscall, args )                           \
-  do {                                                            \
-    if (-1 == (syscall args)) {                                   \
-      TRACE_PERROR (TRACE_FATAL, #syscall); myabort ();           \
-    }                                                             \
-  } while (0)
-#define ENSURE_SYSCALL_AND_SAVE( syscall, args, rc )              \
-  do {                                                            \
-    if (-1 == (rc = (syscall args))) {                            \
-      TRACE_PERROR (TRACE_FATAL, #syscall); myabort ();            \
-    }                                                             \
-  } while (0)
+#define ENSURE_SYSCALL( syscall, args )                            \
+  do {                                                             \
+    if (-1 != (syscall args)) break;                               \
+    else {                                                         \
+      if (errno != EINTR)                                          \
+      { TRACE_PERROR (TRACE_FATAL, #syscall); myabort (); }        \
+    }                                                              \
+  } while (1)
+#define ENSURE_SYSCALL_AND_SAVE( syscall, args, rc )                \
+  do {                                                              \
+    if (-1 != (rc = (syscall args))) break;                         \
+    else {                                                          \
+      { TRACE_PERROR (TRACE_FATAL, #syscall); myabort (); }         \
+    }                                                               \
+  } while (1)
 // E.g. ENSURE_CALL (myfun, (arg1, arg2) != 0)
 #define ENSURE_CALL( call, args)                                        \
   do {                                                                  \

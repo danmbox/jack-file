@@ -1,8 +1,8 @@
 // Copyright (C) 2010-2011 Dan Muresan
 // Part of jack-file (http://danmbox.github.com/jack-file/)
 
-#ifndef __SINTVERT__UTIL_H
-#define __SINTVERT__UTIL_H
+#ifndef __JACKFILE__UTIL_H
+#define __JACKFILE__UTIL_H
 
 #include <stdarg.h>
 #include <assert.h>
@@ -41,4 +41,4 @@ static int setup_sigs (void (*sig_handler) (int), sigset_t *sigmask, unsigned n,
 }
 
 
-#endif  // __SINTVERT__UTIL_H
+#endif  // __JACKFILE__UTIL_H

@@ -1,8 +1,8 @@
 // Copyright (C) 2010-2011 Dan Muresan
 // Part of jack-file (http://danmbox.github.com/jack-file/)
 
-#ifndef __SINTVERT_MEMFILE_H
-#define __SINTVERT_MEMFILE_H
+#ifndef __JACKFILE_MEMFILE_H
+#define __JACKFILE_MEMFILE_H
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,4 +67,4 @@ static int memfile_printf (memfile *f, const char *fmt, ...) {
 }
 
 
-#endif  // __SINTVERT_MEMFILE_H
+#endif  // __JACKFILE_MEMFILE_H

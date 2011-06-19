@@ -11,6 +11,7 @@
 #include <strings.h>
 
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <pthread.h>
@@ -19,6 +20,7 @@
 
 #include <jack/jack.h>
 #include <jack/ringbuffer.h>
+
 #include <sndfile.h>
 
 #include "trace_utils.h"
@@ -31,6 +33,13 @@ const char myrelease [] =
 #define MYNAME "file2jack"
 typedef jack_default_audio_sample_t sample_t;
 
+// other types
+typedef struct {
+  jack_nframes_t orig_frame;
+  pthread_cond_t cvar;
+  pthread_mutex_t lock;
+} disk_thread_arg_t;
+
 // configurable params
 int afterlife = 0;  ///< don't quit after Jack kills us
 int jbuf_frags = 0;  ///< Fragments / cache
@@ -41,6 +50,7 @@ float cache_secs = 0.0;
 sigset_t sigmask;
 pthread_t poll_thread_tid;
 pthread_t main_tid;
+pthread_t disk_thread_tid [2];
 jack_nframes_t srate = 0;  ///< Sampling rate
 jack_client_t *jclient = NULL;
 sem_t zombified;
@@ -59,15 +69,27 @@ int jbuf_free_max = -1;  ///< Max (and initial) value for @c jbuf_free_sem
 jack_nframes_t jbuf_len = 0;
 jack_nframes_t frag_frames = JACK_MAX_FRAMES;  ///< Frames / fragment
 jack_nframes_t jperiodframes = JACK_MAX_FRAMES;  ///< Frames / Jack period
+
+/// Frame that Jack transport wants us to move to.
+jack_nframes_t relocate_frame = JACK_MAX_FRAMES;
+sem_t relocate_sem;  ///< Signals a transport relocation request
+
 unsigned nfiles = 0;
 const char **fname = NULL;  ///< Names of input files
+const char **ftpos_str = NULL;  ///< Positions specified by user
+int *infile_fd = NULL;
 SNDFILE **infile = NULL;
+jack_nframes_t *ftpos = NULL;  ///< Position of files on transport timeline
+pthread_mutex_t files_lock = PTHREAD_MUTEX_INITIALIZER;
+
 
 // --- UTILS ---
 
-// Since sndfile doesn't have it...
-static sf_count_t my_sf_tell (SNDFILE *sndfile)
-{ return sf_seek (sndfile, 0, SEEK_CUR); }
+static SNDFILE *open_sf_fd_read (int fd, int close_desc, SF_INFO *sf_info) {
+  SF_INFO myinfo; if (sf_info == NULL) sf_info = &myinfo;
+  memset (sf_info, 0, sizeof (*sf_info));
+  return sf_open_fd (fd, SFM_READ, sf_info, close_desc);
+}
 
 // --- END UTILS ---
 
@@ -76,41 +98,80 @@ static sf_count_t my_sf_tell (SNDFILE *sndfile)
 
 static void myshutdown (int failure);
 
-
 // Variables for process thread
 sample_t **jportbuf = NULL;  ///< Jack buffers for audio ports
+sample_t *jdata = NULL;
+jack_nframes_t jdatalen = 0;
+int player_ready = 0;  ///< Is relocation & cache prefilling complete?
 
-/// Transport sync callback.
+/// Transport sync callback -- we are a slow-sync client.
 /// Executed in the process thread per Jack docs.
 static int on_jack_sync (jack_transport_state_t state, jack_position_t *pos, void *arg) {
   (void) arg;
 
-  return 1;
+  switch (state) {
+  case JackTransportStopped:
+  case JackTransportStarting: {
+    if (relocate_frame != pos->frame) {
+      player_ready = 0;
+      relocate_frame = pos->frame;
+      ENSURE_SYSCALL (sem_post, (&relocate_sem)); ENSURE_SYSCALL (sem_post, (&relocate_sem));
+      jdata = NULL; jdatalen = 0;
+      TRACE (TRACE_INT, "Relocate to %d", pos->frame);
+    } else {
+      int semval;
+      ENSURE_SYSCALL (sem_getvalue, (&relocate_sem, &semval));
+      if (semval != 0) player_ready = 0;
+      else {
+        ENSURE_SYSCALL (sem_getvalue, (jbuf_free_sem, &semval));
+        player_ready = ((float) ((jbuf_free_max - semval) / 2)) / (jbuf_free_max / 2) >= prefill;
+      }
+    }
+    break;
+  }
+  case JackTransportRolling:
+    player_ready = 0;
+    jack_transport_stop (jclient);
+    if (pos->frame != relocate_frame)
+      jack_transport_locate (jclient, pos->frame);
+    jack_transport_start (jclient);
+    TRACE (TRACE_WARN, "Slow-sync failed, forcing a stop/restart");
+    break;
+  default: ASSERT (0);
+  }
+
+  if (player_ready) {
+    relocate_frame = JACK_MAX_FRAMES;
+    TRACE (TRACE_DIAG, "Transport relocation completed");
+  }
+  return player_ready;
+}
+
+void clear_port_bufs (sample_t **jportbuf, jack_nframes_t nframes) {
+  for (unsigned i = 0; i < nports; i++)
+    memset (jportbuf [i], 0, nframes * sizeof (sample_t));
 }
 
 static void *process_thread (void *arg) {
   (void) arg;
 
-  sample_t *data = NULL;
-  jack_nframes_t jdatalen = 0;
-
   for (;;) {
-    if (jdatalen == 0) {
-      if (data != NULL) {
-        jack_ringbuffer_read_advance (jbuf, frag_frames * nports * sizeof (data [0]));
+    if (jdatalen == 0 && player_ready) {
+      if (jdata != NULL) {
+        jack_ringbuffer_read_advance (jbuf, frag_frames * nports * sizeof (sample_t));
         for (int i = 0; i < 2; i++)
-        ENSURE_SYSCALL (sem_post, (jbuf_free_sem));
-        data = NULL;
+          ENSURE_SYSCALL (sem_post, (jbuf_free_sem));
+        jdata = NULL;
       }
-      int semval = 0;
+      int semval;
       ENSURE_SYSCALL (sem_getvalue, (jbuf_free_sem, &semval));
-      if (semval <= jbuf_free_max - 2) {  // don't count on a half-fragment
+      if (semval <= jbuf_free_max - 2) {  // don't count on half-fragments
         jack_ringbuffer_data_t jdatainfo [2];
         jack_ringbuffer_get_read_vector (jbuf, jdatainfo);
         jdatalen = jdatainfo [0].len / sizeof (sample_t) / nports;
         ASSERT (jdatalen >= frag_frames);
         jdatalen = frag_frames;
-        data = (sample_t *) jdatainfo [0].buf;
+        jdata = (sample_t *) jdatainfo [0].buf;
       }
     }
 
@@ -118,6 +179,7 @@ static void *process_thread (void *arg) {
 
     jack_nframes_t nframes = jack_cycle_wait (jclient);
     ASSERT (nframes == jperiodframes);
+    jack_transport_state_t jtstate = jack_transport_query (jclient, NULL);
 
     for (unsigned i = 0; i < nports; ++i) {
       ASSERT (jport [i] != NULL);
@@ -125,16 +187,17 @@ static void *process_thread (void *arg) {
       ASSERT (jportbuf [i] != NULL);
     }
 
-    if (data == NULL) {
+    if (jtstate != JackTransportRolling || ! player_ready) {
+      clear_port_bufs (jportbuf, nframes);
+    } else if (jdata == NULL) {
       TRACE (TRACE_WARN, "Underrun");
-      for (unsigned i = 0; i < nports; i++)
-        memset (jportbuf [i], 0, nframes * sizeof (data [0]));
+      clear_port_bufs (jportbuf, nframes);
     } else {
       // un-interleave samples
       for (jack_nframes_t f = 0; f < nframes; ++f)
         for (unsigned i = 0; i < nports; ++i)
-          jportbuf [i] [f] = data [f * nports + i];
-      data += nframes * nports;
+          jportbuf [i] [f] = jdata [f * nports + i];
+      jdata += nframes * nports;
       jdatalen -= nframes;
     }
 
@@ -160,29 +223,179 @@ static void *poll_thread (void *arg) {
   return NULL;
 }
 
-static void disk_thread () {
+static int frame2file (jack_nframes_t n) {
+  for (unsigned i = 0; i < nfiles; ++i)
+    if (n < ftpos [i + 1])
+      return i;
+  ASSERT (0); return -1;
+}
+
+static void sf_read_cleanup (void *sndf_) {
+  SNDFILE **sndf = sndf_;
+  int i = sndf - infile;
+  TRACE (TRACE_INT, "read_cleanup i=%d", i);
+  pthread_mutex_lock (&files_lock);
+  sf_close (*sndf);
+  ENSURE_SYSCALL (lseek, (infile_fd [i], 0, SEEK_SET));
+  *sndf = open_sf_fd_read (infile_fd [i], 0, NULL);
+  ASSERT (sndf != NULL);
+  pthread_mutex_unlock (&files_lock);
+}
+
+sf_count_t safe_sf_read_float (int f_idx, float *data, sf_count_t n) {
+  sf_count_t read_frames = 0;
+  int olds;
+  ENSURE_SYSCALL (pthread_setcancelstate, (PTHREAD_CANCEL_ENABLE, &olds));
+  pthread_cleanup_push (sf_read_cleanup, &infile [f_idx]);
+  read_frames = sf_read_float (infile [f_idx], data, n);
+  pthread_cleanup_pop (0);
+  ENSURE_SYSCALL (pthread_setcancelstate, (PTHREAD_CANCEL_DISABLE, &olds));
+  return read_frames;
+}
+
+static void *disk_thread (void *dtarg_) {
+  disk_thread_arg_t *dtarg = dtarg_;
+  int olds;
+
+  sf_count_t offset;
+  ENSURE_SYSCALL (pthread_mutex_lock, (&dtarg->lock));
+  while (dtarg->orig_frame == JACK_MAX_FRAMES)
+    ENSURE_CALL (pthread_cond_wait, (&dtarg->cvar, &dtarg->lock));
+  offset = dtarg->orig_frame;
+  dtarg->orig_frame = JACK_MAX_FRAMES;
+  ENSURE_SYSCALL (pthread_mutex_unlock, (&dtarg->lock));
+  ENSURE_SYSCALL (pthread_setcancelstate, (PTHREAD_CANCEL_DISABLE, &olds));
+
+  int f_idx;
+  MUTEX_LOCK_WITH_CLEANUP (&files_lock); {
+    f_idx = frame2file (offset);
+  } pthread_cleanup_pop (1);
+  offset -= ftpos [f_idx];
+  TRACE (TRACE_DIAG, "disk thread starting, seg=%d, offset=%lld", f_idx, offset);
+
   for (;;) {
-    sem_wait (jbuf_free_sem);  // this frees a half-fragment
+    ENSURE_SYSCALL (pthread_setcancelstate, (PTHREAD_CANCEL_ENABLE, &olds));
+    ENSURE_SYSCALL (sem_wait, (jbuf_free_sem));  // this frees a half-fragment
+    ENSURE_SYSCALL (pthread_setcancelstate, (PTHREAD_CANCEL_DISABLE, &olds));
     jack_ringbuffer_data_t jdatainfo [2];
     jack_ringbuffer_get_write_vector (jbuf, jdatainfo);
     ASSERT (jdatainfo [0].len / sizeof (sample_t) / nports >= frag_frames);
-    sample_t *data = (sample_t *) jdatainfo [0].buf;
-    sf_count_t read = sf_read_float (infile [0], data, frag_frames);
-    if (read < frag_frames)
-      memset (data + read, 0, (frag_frames - read) * nports * sizeof (sample_t));
+    sample_t *wptr = (sample_t *) jdatainfo [0].buf;
+    sf_count_t read_frames = 0;
+    for (sf_count_t toread = frag_frames; toread > 0;
+         toread -= read_frames, wptr += read_frames * nports)
+    {
+      int seg_done = 0;
+      if (infile [f_idx] != NULL) {
+        if (offset != JACK_MAX_FRAMES) {
+          sf_seek (infile [f_idx], offset, SEEK_SET);
+          offset = JACK_MAX_FRAMES;
+        }
+        read_frames = safe_sf_read_float (f_idx, wptr, toread);
+        if (read_frames < toread)
+          seg_done = 1;
+      } else {
+        sf_count_t avail = JACK_MAX_FRAMES;
+        if (JACK_MAX_FRAMES != ftpos [f_idx + 1])
+          avail = ftpos [f_idx + 1] - ftpos [f_idx] - offset;
+        if (avail > toread) {
+          read_frames = toread;
+          offset += read_frames;
+        } else {
+          read_frames = avail;
+          seg_done = 1;
+        }
+        memset (wptr, 0, read_frames * nports * sizeof (sample_t));
+      }
+
+      if (seg_done) {
+        ++f_idx;
+        offset = 0;
+      }
+    }
     jack_ringbuffer_write_advance (jbuf, frag_frames * nports * sizeof (sample_t));
-    sem_wait (jbuf_free_sem);  // now mark the other half as free
+    ENSURE_SYSCALL (sem_wait, (jbuf_free_sem));  // now mark the other half as free
+  }
+
+  return NULL;
+}
+
+static void signal_disk_thread (disk_thread_arg_t *dtarg) {
+  ENSURE_CALL (pthread_mutex_lock, (&dtarg->lock));
+  ASSERT (JACK_MAX_FRAMES == dtarg->orig_frame);
+  dtarg->orig_frame = relocate_frame;
+  ENSURE_CALL (pthread_cond_signal, (&dtarg->cvar));
+  ENSURE_CALL (pthread_mutex_unlock, (&dtarg->lock));
+  TRACE (TRACE_INT, "Disk thread signalled");
+}
+
+/// Manages two disk threads -- one is active and one is a back-up.
+/// When the Jack transport skips, we cancel the active thread and signal the
+/// back-up thread to become active. This avoids having to wait for lengthy
+/// I/O to complete. A back-up thread is always ready and waiting, to avoid
+/// latency due to pthread_create().
+static void manage_disk_threads () {
+  disk_thread_arg_t dtarg [2];
+  for (unsigned i = 0; i < 2; ++i) {
+    ENSURE_SYSCALL (pthread_mutex_init, (&dtarg [i].lock, NULL));
+    ENSURE_SYSCALL (pthread_cond_init, (&dtarg [i].cvar, NULL));
+    dtarg [i].orig_frame = JACK_MAX_FRAMES;
+  }
+
+  ENSURE_SYSCALL (sem_wait, (&relocate_sem));  // or sem_init with -1...
+  for (;;) {
+    ENSURE_SYSCALL (sem_wait, (&relocate_sem));
+
+    unsigned which = 0;
+    for (; which < 2; ++which)
+      if (! pthread_equal (disk_thread_tid [which], main_tid)) {
+        signal_disk_thread (&dtarg [which]);
+        break;
+      }
+    for (unsigned i = 0; i < 2; ++i)
+      if (pthread_equal (disk_thread_tid [i], main_tid)) {
+        ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
+        ENSURE_SYSCALL (pthread_create, (&disk_thread_tid [i], NULL, disk_thread, &dtarg [i]));
+        ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
+        TRACE (TRACE_DIAG, "New disk thread %d created", i);
+        if (which == 2) {
+          which = i;
+          signal_disk_thread (&dtarg [which]);
+        }
+      }
+    ASSERT (which != 2);
+
+    ENSURE_SYSCALL (sem_wait, (&relocate_sem));
+    TRACE (TRACE_DIAG, "Cancelling active disk thread %d", which);
+    pthread_cancel_and_join_if_started (disk_thread_tid [which], main_tid);
+    disk_thread_tid [which] = main_tid;
+
+    jack_ringbuffer_reset (jbuf);
+    int semval;
+    ENSURE_SYSCALL (sem_getvalue, (jbuf_free_sem, &semval));
+    for (; semval < jbuf_free_max; ++semval)
+      sem_post (jbuf_free_sem);
   }
 }
 
 static void setup_input_files () {
   ASSERT (nfiles > 0);
-  infile = malloc (nfiles * sizeof (infile [0]));
+  infile_fd = malloc ((1 + nfiles) * sizeof (infile_fd [0]));
+  infile = malloc ((1 + nfiles) * sizeof (infile [0]));
+  ftpos = malloc ((1 + nfiles) * sizeof (ftpos [0]));
+  ftpos [0] = 0;
   for (unsigned i = 0; i < nfiles; ++i) {
-    SF_INFO sf_info; memset (&sf_info, 0, sizeof (sf_info));
-    infile [i] = sf_open (fname [i], SFM_READ, &sf_info);
+    ftpos [i + 1] = ftpos [i];
+    TRACE (TRACE_INT, "%s @%d",
+           fname [i] == NULL ? "*" : fname [i], ftpos [i]);
+    if (fname [i] == NULL) continue;
+
+    ENSURE_SYSCALL_AND_SAVE (open, (fname [i], O_RDONLY), infile_fd [i]);
+    SF_INFO sf_info;
+    infile [i] = open_sf_fd_read (infile_fd [i], 0, &sf_info);
     if (NULL == infile [i]) {
-      TRACE (TRACE_FATAL, "Could not open file %s", fname [i]);
+      TRACE (TRACE_FATAL, "Could not open file %s: %s",
+             fname [i], sf_strerror (NULL));
       myshutdown (1);
     }
     if (srate == 0) srate = sf_info.samplerate;
@@ -197,7 +410,9 @@ static void setup_input_files () {
              fname [i], sf_info.channels, nports);
       myshutdown (1);
     }
+    ftpos [i + 1] += sf_info.frames;
   }
+  ftpos [nfiles] = JACK_MAX_FRAMES;
 }
 
 static void on_jack_shutdown (void *arg) {
@@ -211,21 +426,7 @@ static void on_jack_shutdown (void *arg) {
   }
 }
 
-static void setup_audio () {
-  TRACE (TRACE_DIAG, "jack setup");
-  trace_flush (); fflush(NULL);
-
-  jack_options_t jopt = JackNullOption;  // JackNoStartServer;
-  jack_status_t jstat;
-  ENSURE_CALL_AND_SAVE (jack_client_open, (MYNAME, jopt, &jstat), jclient, NULL);
-  jack_on_shutdown (jclient, on_jack_shutdown, NULL);
-
-  jack_nframes_t jsrate = jack_get_sample_rate (jclient);
-  if (jsrate != srate) {
-    TRACE (TRACE_FATAL, "Jack sample rate %d does not match input files (%d)",
-           jsrate, srate);
-    myshutdown (1);
-  }
+static void compute_frames () {
   jperiodframes = jack_get_buffer_size (jclient);
   if (cache_secs > 0) jbuf_len = nports * srate * cache_secs + 0.5;
   else jbuf_len = (1 << 18) * nports;
@@ -243,6 +444,24 @@ static void setup_audio () {
   }
   frag_frames = jbuf_len / (jbuf_frags * nports);
   jbuf_free_max = 2 * (jbuf_frags - 1);  // One frag wasted due to sentinel byte...
+}
+
+static void setup_audio () {
+  TRACE (TRACE_DIAG, "jack setup");
+  trace_flush (); fflush(NULL);
+
+  jack_options_t jopt = JackNullOption;  // JackNoStartServer;
+  jack_status_t jstat;
+  ENSURE_CALL_AND_SAVE (jack_client_open, (MYNAME, jopt, &jstat), jclient, NULL);
+  jack_on_shutdown (jclient, on_jack_shutdown, NULL);
+
+  jack_nframes_t jsrate = jack_get_sample_rate (jclient);
+  if (jsrate != srate) {
+    TRACE (TRACE_FATAL, "Jack sample rate %d does not match input files (%d)",
+           jsrate, srate);
+    myshutdown (1);
+  }
+  compute_frames ();
 
   jbuf = jack_ringbuffer_create (jbuf_len * sizeof (sample_t)); ASSERT (jbuf != NULL);
   ENSURE_SYSCALL (sem_init, (&jbuf_free_sem_store, 0, jbuf_free_max));
@@ -306,7 +525,8 @@ static void parse_args (char **argv) {
   if (argv [0] == NULL) usage (NULL);
 
   unsigned nfiles_max = 100;
-  fname = malloc (nfiles_max * sizeof (fname [0]));
+  fname = malloc (2 * nfiles_max * sizeof (fname [0]));
+  ftpos_str = malloc (2 * nfiles_max * sizeof (ftpos [0]));
 
   for (++argv; *argv != NULL; ++argv) {
     if (*argv [0] == '-') {
@@ -318,8 +538,9 @@ static void parse_args (char **argv) {
         printf ("%s version %s\n%s\n", MYNAME, myrelease, "Copyright (C) 2011 Dan Muresan");
         exit (EXIT_SUCCESS);
       } else if (0 == strcmp (*argv, "-i")) {
-        ASSERT (nfiles < nfiles_max);
-        fname [nfiles++] = *++argv;
+        ASSERT (nfiles + 1 < nfiles_max);
+        ftpos_str [nfiles] = ":"; fname [nfiles++] = NULL;
+        ftpos_str [nfiles] = ":"; fname [nfiles++] = *++argv;
       } else if (0 == strcmp (*argv, "--log-level")) {
         int l;
         if (sscanf (*++argv, "%d", &l) != 1)
@@ -335,6 +556,7 @@ static void parse_args (char **argv) {
       }
     }
   }
+  ftpos_str [nfiles] = ":"; fname [nfiles++] = NULL;
 }
 
 static void init_trace () {
@@ -349,6 +571,8 @@ static void cleanup () {
   if (0 == sem_getvalue (&zombified, &z) && z > 0)
     TRACE (TRACE_FATAL, "Jack shut us down");
   pthread_cancel_and_join_if_started (poll_thread_tid, main_tid);
+  for (unsigned i = 0; i < 2; ++i)
+    pthread_cancel_and_join_if_started (disk_thread_tid [i], main_tid);
   if (jclient != NULL) {
     if (z == 0) sem_post (&zombified);  // main already knows about it, signal others
     jack_client_close (jclient);
@@ -396,8 +620,11 @@ static void sig_handler (int sig) {
 static void init_globals () {
   main_tid = pthread_self ();
   poll_thread_tid = main_tid;
+  for (unsigned i = 0; i < 2; ++i)
+    disk_thread_tid [i] = main_tid;
   ENSURE_SYSCALL (sigemptyset, (&sigmask));
   ENSURE_SYSCALL (sem_init, (&zombified, 0, 0));
+  ENSURE_SYSCALL (sem_init, (&relocate_sem, 0, 0));
 }
 
 int main (int argc, char **argv) {
@@ -424,9 +651,7 @@ int main (int argc, char **argv) {
   setup_audio ();
   ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
 
-  disk_thread ();
-
-  for (;;) pause ();
+  manage_disk_threads ();
 
   myshutdown (0); assert (0);
 }

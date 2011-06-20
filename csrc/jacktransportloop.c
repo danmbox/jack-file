@@ -285,7 +285,7 @@ int main (int argc, char **argv) {
 
   init_globals ();
 
-  if (! setup_sigs (sig_handler, &sigmask, 7, SIGTERM, SIGQUIT, SIGABRT, SIGPIPE, SIGFPE, SIGINT, SIGALRM)) {
+  if (! setup_sigs (sig_handler, &sigmask, SA_RESTART, 7, SIGTERM, SIGQUIT, SIGABRT, SIGPIPE, SIGFPE, SIGINT, SIGALRM)) {
     TRACE_PERROR (TRACE_FATAL, "signal setup");
     return 1;
   }

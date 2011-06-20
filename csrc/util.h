@@ -23,14 +23,14 @@ static void mutex_cleanup_routine (void *lock_) {
   pthread_mutex_lock (lock);                            \
   pthread_cleanup_push (mutex_cleanup_routine, (lock))
 
-static int setup_sigs (void (*sig_handler) (int), sigset_t *sigmask, unsigned n, ...) {
+static int setup_sigs (void (*sig_handler) (int), sigset_t *sigmask, int flags, unsigned n, ...) {
   va_list ap; va_start (ap, n);
   for (unsigned i = 0; i < n; ++i)
     if (0 != sigaddset (sigmask, va_arg (ap, int)))
       return 0;
   va_end (ap);
   struct sigaction act =
-    { .sa_mask = *sigmask, .sa_flags = 0, .sa_handler = sig_handler };
+    { .sa_mask = *sigmask, .sa_flags = flags, .sa_handler = sig_handler };
   va_start (ap, n);
   for (unsigned i = 0; i < n; ++i)
     if (0 != sigaction (va_arg (ap, int), &act, NULL))

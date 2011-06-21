@@ -40,6 +40,11 @@ typedef struct {
   pthread_mutex_t lock;
 } disk_thread_arg_t;
 
+typedef struct {
+  int fd;
+  sf_count_t sz;
+} mysf_vio_data;
+
 // configurable params
 int afterlife = 0;  ///< don't quit after Jack kills us
 int jbuf_frags = 0;  ///< Fragments / cache
@@ -47,7 +52,7 @@ float prefill = 0.25;  ///< Cache prefill fraction
 float cache_secs = 0.0;
 
 // internal vars
-sigset_t sigmask;
+sigset_t sigmask, sigusr2_mask;
 pthread_t poll_thread_tid;
 pthread_t main_tid;
 pthread_t disk_thread_tid [2];
@@ -73,11 +78,12 @@ jack_nframes_t jperiodframes = JACK_MAX_FRAMES;  ///< Frames / Jack period
 /// Frame that Jack transport wants us to move to.
 jack_nframes_t relocate_frame = JACK_MAX_FRAMES;
 sem_t relocate_sem;  ///< Signals a transport relocation request
+sem_t disk_cancel_sem;
 
 unsigned nfiles = 0;
 const char **fname = NULL;  ///< Names of input files
 const char **ftpos_str = NULL;  ///< Positions specified by user
-int *infile_fd = NULL;
+mysf_vio_data *infile_vio = NULL;
 SNDFILE **infile = NULL;
 jack_nframes_t *ftpos = NULL;  ///< Position of files on transport timeline
 pthread_mutex_t files_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -85,18 +91,13 @@ pthread_mutex_t files_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // --- UTILS ---
 
-static SNDFILE *open_sf_fd_read (int fd, int close_desc, SF_INFO *sf_info) {
-  SF_INFO myinfo; if (sf_info == NULL) sf_info = &myinfo;
-  memset (sf_info, 0, sizeof (*sf_info));
-  return sf_open_fd (fd, SFM_READ, sf_info, close_desc);
-}
-
 // --- END UTILS ---
 
 
 // --- PROGRAM ---
 
 static void myshutdown (int failure);
+static void sig_handler (int sig);
 
 // Variables for process thread
 sample_t **jportbuf = NULL;  ///< Jack buffers for audio ports
@@ -216,11 +217,98 @@ static void *poll_thread (void *arg) {
 
   for (;;) {
     trace_flush ();
-    struct timespec sleepreq = { tv_sec: 0, tv_nsec: 200000000L };
+    struct timespec sleepreq = { tv_sec: 0, tv_nsec: 166000000L };
     nanosleep (&sleepreq, NULL);
   }
 
   return NULL;
+}
+
+/// Flag set by virtual I/O functions
+int disk_cancel_flag = 0;
+
+sf_count_t  mysf_vio_get_filelen (void *user_data) {
+  return ((mysf_vio_data *) user_data)->sz;
+}
+
+sf_count_t  mysf_vio_seek (sf_count_t offset, int whence, void *user_data) {
+  off_t rc = (off_t) -1;
+  ENSURE_SYSCALL_AND_SAVE (lseek, (((mysf_vio_data *) user_data)->fd, offset, whence), rc);
+  TRACE (TRACE_INT, "lseek %lld (whence=%d), ret=%ld", offset, whence, rc);
+  return rc;
+}
+
+typedef ssize_t (*io_syscall) (int, void *, size_t);
+
+static int test_disk_cancel_sem () {
+  TRACE (TRACE_INT + 3, "testing IO cancellation");
+  for (;;) {  // test for cancelled I/O
+    int rc = sem_trywait (&disk_cancel_sem);
+    if (rc == -1) {
+      if (EINTR == errno) continue;
+      ASSERT (EAGAIN == errno);
+      return 0;
+    } else {
+      return (disk_cancel_flag = 1);
+    }
+  }
+}
+
+static sf_count_t mysf_vio_rw (void *ptr, sf_count_t count, mysf_vio_data *data, io_syscall io) {
+  sf_count_t done = 0;
+  int rc;
+
+  while (done < count) {
+    if (test_disk_cancel_sem ()) {
+      return 0;  // cause decoder to exit ASAP
+#if 0  // fake a successful read; still causes un-clearable decoder errors
+      off_t cur = lseek (data->fd, 0, SEEK_CUR);
+      sf_count_t max_count = done + data->sz - cur;
+      TRACE (TRACE_INT, "cancelling IO req=%lld, max=%lld", count, max_count);
+      if (count > max_count) count = max_count;
+      lseek (data->fd, count - done, SEEK_CUR);
+      return count;
+#endif
+    }
+
+    TRACE (TRACE_INT + 3, "start io=%lld/%lld", done, count);
+    rc = io (data->fd, ptr, count - done);
+    if (rc < 0) {
+      ASSERT (EINTR == errno);
+    } else if (rc > 0) {
+      done += rc;
+    } else break;
+  }
+  TRACE (TRACE_INT + 2, "end IO=%lld/%lld", done, count);
+  return done;
+}
+
+static sf_count_t  mysf_vio_read (void *ptr, sf_count_t count, void *user_data) {
+  return mysf_vio_rw (ptr, count, (mysf_vio_data *) user_data, read);
+}
+
+static sf_count_t  mysf_vio_write (const void *ptr, sf_count_t count, void *user_data) {
+  return mysf_vio_rw ((void *) ptr, count, (mysf_vio_data *) user_data, (io_syscall) write);
+}
+
+static sf_count_t  mysf_vio_tell (void *user_data) {
+  sf_count_t rc;
+  ENSURE_SYSCALL_AND_SAVE (lseek, (((mysf_vio_data *) user_data)->fd, 0, SEEK_CUR), rc);
+  return rc;
+}
+
+SF_VIRTUAL_IO mysf_vio = {
+  mysf_vio_get_filelen,
+  mysf_vio_seek,
+  mysf_vio_read,
+  mysf_vio_write,
+  mysf_vio_tell
+};
+
+static SNDFILE *open_sf_fd_read (mysf_vio_data *data, SF_INFO *sf_info) {
+  SF_INFO myinfo; if (sf_info == NULL) sf_info = &myinfo;
+  memset (sf_info, 0, sizeof (*sf_info));
+  return sf_open_virtual (&mysf_vio, SFM_READ, sf_info, data);
 }
 
 static int frame2file (jack_nframes_t n) {
@@ -230,32 +318,8 @@ static int frame2file (jack_nframes_t n) {
   ASSERT (0); return -1;
 }
 
-static void sf_read_cleanup (void *sndf_) {
-  SNDFILE **sndf = sndf_;
-  int i = sndf - infile;
-  TRACE (TRACE_INT, "read_cleanup i=%d", i);
-  pthread_mutex_lock (&files_lock);
-  sf_close (*sndf);
-  ENSURE_SYSCALL (lseek, (infile_fd [i], 0, SEEK_SET));
-  *sndf = open_sf_fd_read (infile_fd [i], 0, NULL);
-  ASSERT (sndf != NULL);
-  pthread_mutex_unlock (&files_lock);
-}
-
-sf_count_t safe_sf_read_float (int f_idx, float *data, sf_count_t n) {
-  sf_count_t read_frames = 0;
-  int olds;
-  ENSURE_SYSCALL (pthread_setcancelstate, (PTHREAD_CANCEL_ENABLE, &olds));
-  pthread_cleanup_push (sf_read_cleanup, &infile [f_idx]);
-  read_frames = sf_read_float (infile [f_idx], data, n);
-  pthread_cleanup_pop (0);
-  ENSURE_SYSCALL (pthread_setcancelstate, (PTHREAD_CANCEL_DISABLE, &olds));
-  return read_frames;
-}
-
 static void *disk_thread (void *dtarg_) {
   disk_thread_arg_t *dtarg = dtarg_;
-  int olds;
 
   sf_count_t offset;
   ENSURE_SYSCALL (pthread_mutex_lock, (&dtarg->lock));
@@ -264,7 +328,6 @@ static void *disk_thread (void *dtarg_) {
   offset = dtarg->orig_frame;
   dtarg->orig_frame = JACK_MAX_FRAMES;
   ENSURE_SYSCALL (pthread_mutex_unlock, (&dtarg->lock));
-  ENSURE_SYSCALL (pthread_setcancelstate, (PTHREAD_CANCEL_DISABLE, &olds));
 
   int f_idx;
   MUTEX_LOCK_WITH_CLEANUP (&files_lock); {
@@ -273,10 +336,21 @@ static void *disk_thread (void *dtarg_) {
   offset -= ftpos [f_idx];
   TRACE (TRACE_DIAG, "disk thread starting, seg=%d, offset=%lld", f_idx, offset);
 
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigusr2_mask, NULL));
+  disk_cancel_flag = 0;
+
   for (;;) {
-    ENSURE_SYSCALL (pthread_setcancelstate, (PTHREAD_CANCEL_ENABLE, &olds));
-    ENSURE_SYSCALL (sem_wait, (jbuf_free_sem));  // this frees a half-fragment
-    ENSURE_SYSCALL (pthread_setcancelstate, (PTHREAD_CANCEL_DISABLE, &olds));
+    // wait on semaphore, possibly cancelling on EINTR
+    // this frees up a half-fragment -- we free the other @ the end
+    int rc;
+    while ((rc = sem_wait (jbuf_free_sem)) == -1) {
+      ASSERT (EINTR == errno);
+      TRACE (TRACE_INT + 1, "sem_wait (jbuf) EINTR");
+      if (test_disk_cancel_sem ())
+      { TRACE (TRACE_DIAG, "disk thread exiting"); pthread_exit (0); }
+      else continue;
+    }
+    TRACE (TRACE_INT + 2, "start frag");
     jack_ringbuffer_data_t jdatainfo [2];
     jack_ringbuffer_get_write_vector (jbuf, jdatainfo);
     ASSERT (jdatainfo [0].len / sizeof (sample_t) / nports >= frag_frames);
@@ -288,12 +362,24 @@ static void *disk_thread (void *dtarg_) {
       int seg_done = 0;
       if (infile [f_idx] != NULL) {
         if (offset != JACK_MAX_FRAMES) {
-          sf_seek (infile [f_idx], offset, SEEK_SET);
+          TRACE (TRACE_INT + 1, "seek=%lld frames", offset);
+          read_frames = sf_seek (infile [f_idx], offset, SEEK_SET);
+          ASSERT (read_frames == offset);
           offset = JACK_MAX_FRAMES;
         }
-        read_frames = safe_sf_read_float (f_idx, wptr, toread);
-        if (read_frames < toread)
+        TRACE (TRACE_INT + 2, "toread=%lld frames", toread);
+        read_frames = sf_read_float (infile [f_idx], wptr, toread);
+        if (disk_cancel_flag) {
+          TRACE (TRACE_DIAG, "read cancelled, exiting");
+          sf_close (infile [f_idx]);
+          ENSURE_SYSCALL (lseek, (infile_vio [f_idx].fd, 0, SEEK_SET));
+          infile [f_idx] = open_sf_fd_read (&infile_vio [f_idx], NULL);
+          pthread_exit (0);
+        }
+        if (read_frames < toread) {
+          TRACE (TRACE_INT, "Assuming end of seg, got %lld/%lld frames", read_frames, toread);
           seg_done = 1;
+        }
       } else {
         sf_count_t avail = JACK_MAX_FRAMES;
         if (JACK_MAX_FRAMES != ftpos [f_idx + 1])
@@ -309,10 +395,12 @@ static void *disk_thread (void *dtarg_) {
       }
 
       if (seg_done) {
+        TRACE (TRACE_INT, "finished seg=%d", f_idx);
         ++f_idx;
         offset = 0;
       }
     }
+    TRACE (TRACE_INT + 1, "frag read");
     jack_ringbuffer_write_advance (jbuf, frag_frames * nports * sizeof (sample_t));
     ENSURE_SYSCALL (sem_wait, (jbuf_free_sem));  // now mark the other half as free
   }
@@ -367,7 +455,9 @@ static void manage_disk_threads () {
 
     ENSURE_SYSCALL (sem_wait, (&relocate_sem));
     TRACE (TRACE_DIAG, "Cancelling active disk thread %d", which);
-    pthread_cancel_and_join_if_started (disk_thread_tid [which], main_tid);
+    ENSURE_SYSCALL (sem_post, (&disk_cancel_sem));
+    pthread_kill (disk_thread_tid [which], SIGUSR2);
+    void *rc; ENSURE_SYSCALL (pthread_join, (disk_thread_tid [which], &rc));
     disk_thread_tid [which] = main_tid;
 
     jack_ringbuffer_reset (jbuf);
@@ -380,7 +470,7 @@ static void manage_disk_threads () {
 
 static void setup_input_files () {
   ASSERT (nfiles > 0);
-  infile_fd = malloc ((1 + nfiles) * sizeof (infile_fd [0]));
+  infile_vio = malloc ((1 + nfiles) * sizeof (infile_vio [0]));
   infile = malloc ((1 + nfiles) * sizeof (infile [0]));
   ftpos = malloc ((1 + nfiles) * sizeof (ftpos [0]));
   ftpos [0] = 0;
@@ -390,9 +480,14 @@ static void setup_input_files () {
            fname [i] == NULL ? "*" : fname [i], ftpos [i]);
     if (fname [i] == NULL) continue;
 
-    ENSURE_SYSCALL_AND_SAVE (open, (fname [i], O_RDONLY), infile_fd [i]);
+    ENSURE_SYSCALL_AND_SAVE (open, (fname [i], O_RDONLY), infile_vio [i].fd);
+    {
+      struct stat buf;
+      ENSURE_SYSCALL (fstat, (infile_vio [i].fd, &buf));
+      infile_vio [i].sz = buf.st_size;
+    }
     SF_INFO sf_info;
-    infile [i] = open_sf_fd_read (infile_fd [i], 0, &sf_info);
+    infile [i] = open_sf_fd_read (&infile_vio [i], &sf_info);
     if (NULL == infile [i]) {
       TRACE (TRACE_FATAL, "Could not open file %s: %s",
              fname [i], sf_strerror (NULL));
@@ -599,9 +694,12 @@ static void myshutdown (int failure) {
 }
 
 static void sig_handler (int sig) {
+  pthread_t self_tid = pthread_self ();
+  if (sig == SIGUSR2) { ASSERT (! pthread_equal (self_tid, main_tid)); return; }
+
   // We should be in the main thread -- all other threads block signals.
   // But linked libs could screw up our sigmask and handlers...
-  if (! pthread_equal (pthread_self (), main_tid)) {
+  if (! pthread_equal (self_tid, main_tid)) {
     TRACE (TRACE_WARN, "Signal %d redirected to main thread", sig);
     pthread_kill (main_tid, sig); for (;;) pause ();
   }
@@ -623,8 +721,10 @@ static void init_globals () {
   for (unsigned i = 0; i < 2; ++i)
     disk_thread_tid [i] = main_tid;
   ENSURE_SYSCALL (sigemptyset, (&sigmask));
+  ENSURE_SYSCALL (sigemptyset, (&sigusr2_mask));
   ENSURE_SYSCALL (sem_init, (&zombified, 0, 0));
   ENSURE_SYSCALL (sem_init, (&relocate_sem, 0, 0));
+  ENSURE_SYSCALL (sem_init, (&disk_cancel_sem, 0, 0));
 }
 
 int main (int argc, char **argv) {
@@ -634,10 +734,13 @@ int main (int argc, char **argv) {
 
   init_globals ();
 
-  if (! setup_sigs (sig_handler, &sigmask, SA_RESTART, 7, SIGTERM, SIGQUIT, SIGABRT, SIGPIPE, SIGFPE, SIGINT, SIGALRM)) {
+  if (! setup_sigs (sig_handler, &sigmask, SA_RESTART, 7, SIGTERM, SIGQUIT, SIGABRT, SIGPIPE, SIGFPE, SIGINT, SIGALRM) ||
+      ! setup_sigs (sig_handler, &sigusr2_mask, 0, 1, SIGUSR2))
+  {
     TRACE_PERROR (TRACE_FATAL, "signal setup");
     return 1;
   }
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigusr2_mask, NULL));
 
   parse_args (argv);
 

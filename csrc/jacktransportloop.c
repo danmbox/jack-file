@@ -20,7 +20,7 @@
 #include <jack/jack.h>
 
 #include "trace_utils.h"
-
+#include "tmutil.h"
 
 const char myrelease [] =
 #include "release.h"
@@ -131,25 +131,6 @@ static void on_jack_shutdown (void *arg) {
   }
 }
 
-static jack_nframes_t convert_time (const char *t, jack_nframes_t srate) {
-  if (t == NULL) return JACK_MAX_FRAMES;
-  jack_nframes_t ret;
-  char extra;
-  int slen = strlen (t);
-  int in_frames = t [slen - 1] == 's';
-  if (in_frames) {
-    if (sscanf (t, "%u%*c%c", &ret, &extra) != 1)
-      usage ("Bad number %s", t);
-  }
-  else {
-    double sec;
-    if (sscanf (t, "%lf%c", &sec, &extra) != 1)
-      usage ("Bad number %s", t);
-    ret = sec * srate;
-  }
-  return ret;
-}
-
 static void setup_audio () {
   TRACE (TRACE_DIAG, "jack setup");
   trace_flush (); fflush(NULL);
@@ -160,9 +141,9 @@ static void setup_audio () {
   jack_on_shutdown (jclient, on_jack_shutdown, NULL);
 
   srate = jack_get_sample_rate (jclient);
-  loop_beg_frame = convert_time (loop_beg_str, srate);
-  loop_end_frame = convert_time (loop_end_str, srate);
-  t0_frame = convert_time (t0_str, srate);
+  ENSURE_CALL (convert_time, (loop_beg_str, srate, &loop_beg_frame) == 0);
+  ENSURE_CALL (convert_time, (loop_end_str, srate, &loop_end_frame) == 0);
+  ENSURE_CALL (convert_time, (t0_str, srate, &t0_frame) == 0);
 
   ENSURE_CALL (jack_set_process_thread, (jclient, process_thread, NULL) != 0);
 

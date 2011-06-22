@@ -24,6 +24,7 @@
 #include <sndfile.h>
 
 #include "trace_utils.h"
+#include "tmutil.h"
 
 const char myrelease [] =
 #include "release.h"
@@ -80,12 +81,15 @@ jack_nframes_t relocate_frame = JACK_MAX_FRAMES;
 sem_t relocate_sem;  ///< Signals a transport relocation request
 sem_t disk_cancel_sem;
 
-unsigned nfiles = 0;
+int nfiles = 0;
 const char **fname = NULL;  ///< Names of input files
 const char **ftpos_str = NULL;  ///< Positions specified by user
 mysf_vio_data *infile_vio = NULL;
 SNDFILE **infile = NULL;
 jack_nframes_t *ftpos = NULL;  ///< Position of files on transport timeline
+jack_nframes_t loop_start_frame = JACK_MAX_FRAMES;
+const char *loop_start_str = NULL;
+unsigned loop_start_file = -1;
 pthread_mutex_t files_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
@@ -225,7 +229,7 @@ static void *poll_thread (void *arg) {
 }
 
 /// Flag set by virtual I/O functions
-int disk_cancel_flag = 0;
+volatile int disk_cancel_flag = 0;
 
 sf_count_t  mysf_vio_get_filelen (void *user_data) {
   return ((mysf_vio_data *) user_data)->sz;
@@ -240,6 +244,7 @@ sf_count_t  mysf_vio_seek (sf_count_t offset, int whence, void *user_data) {
 
 typedef ssize_t (*io_syscall) (int, void *, size_t);
 
+#if 0
 static int test_disk_cancel_sem () {
   TRACE (TRACE_INT + 3, "testing IO cancellation");
   for (;;) {  // test for cancelled I/O
@@ -253,13 +258,15 @@ static int test_disk_cancel_sem () {
     }
   }
 }
+#endif
 
 static sf_count_t mysf_vio_rw (void *ptr, sf_count_t count, mysf_vio_data *data, io_syscall io) {
   sf_count_t done = 0;
   int rc;
 
   while (done < count) {
-    if (test_disk_cancel_sem ()) {
+    if (disk_cancel_flag) {
+      TRACE (TRACE_DIAG, "IO cancelled, returning short count");
       return 0;  // cause decoder to exit ASAP
 #if 0  // fake a successful read; still causes un-clearable decoder errors
       off_t cur = lseek (data->fd, 0, SEEK_CUR);
@@ -311,11 +318,32 @@ static SNDFILE *open_sf_fd_read (mysf_vio_data *data, SF_INFO *sf_info) {
   return sf_open_virtual (&mysf_vio, SFM_READ, sf_info, data);
 }
 
-static int frame2file (jack_nframes_t n) {
-  for (unsigned i = 0; i < nfiles; ++i)
-    if (n < ftpos [i + 1])
-      return i;
+static int frame2file (sf_count_t *n) {
+  for (int i = 0; i < nfiles; ++i)
+    if (*n < ftpos [i + 1]) {
+      if (JACK_MAX_FRAMES == loop_start_frame || *n < ftpos [nfiles - 1]) {
+        *n -= ftpos [i];
+        return i;
+      }
+      ASSERT (i == nfiles - 1);
+      *n -= ftpos [i];
+      *n = *n % (ftpos [i] - loop_start_frame);
+      *n += loop_start_frame;
+      return frame2file (n);
+    }
+
   ASSERT (0); return -1;
+}
+
+static void disk_thread_chk_cancel_and_cleanup (int f_idx) {
+  if (disk_cancel_flag) {
+    disk_cancel_flag = 0;
+    TRACE (TRACE_DIAG, "IO cancelled, exiting");
+    sf_close (infile [f_idx]);
+    ENSURE_SYSCALL (lseek, (infile_vio [f_idx].fd, 0, SEEK_SET));
+    ENSURE_CALL_AND_SAVE (open_sf_fd_read, (&infile_vio [f_idx], NULL), infile [f_idx], NULL);
+    pthread_exit (0);
+  }
 }
 
 static void *disk_thread (void *dtarg_) {
@@ -330,14 +358,11 @@ static void *disk_thread (void *dtarg_) {
   ENSURE_SYSCALL (pthread_mutex_unlock, (&dtarg->lock));
 
   int f_idx;
-  MUTEX_LOCK_WITH_CLEANUP (&files_lock); {
-    f_idx = frame2file (offset);
-  } pthread_cleanup_pop (1);
-  offset -= ftpos [f_idx];
+  f_idx = frame2file (&offset);
   TRACE (TRACE_DIAG, "disk thread starting, seg=%d, offset=%lld", f_idx, offset);
 
-  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigusr2_mask, NULL));
   disk_cancel_flag = 0;
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigusr2_mask, NULL));
 
   for (;;) {
     // wait on semaphore, possibly cancelling on EINTR
@@ -346,7 +371,7 @@ static void *disk_thread (void *dtarg_) {
     while ((rc = sem_wait (jbuf_free_sem)) == -1) {
       ASSERT (EINTR == errno);
       TRACE (TRACE_INT + 1, "sem_wait (jbuf) EINTR");
-      if (test_disk_cancel_sem ())
+      if (disk_cancel_flag)
       { TRACE (TRACE_DIAG, "disk thread exiting"); pthread_exit (0); }
       else continue;
     }
@@ -360,22 +385,17 @@ static void *disk_thread (void *dtarg_) {
          toread -= read_frames, wptr += read_frames * nports)
     {
       int seg_done = 0;
-      if (infile [f_idx] != NULL) {
+      if (infile [f_idx] != NULL) {  // file segment
         if (offset != JACK_MAX_FRAMES) {
-          TRACE (TRACE_INT + 1, "seek=%lld frames", offset);
           read_frames = sf_seek (infile [f_idx], offset, SEEK_SET);
+          disk_thread_chk_cancel_and_cleanup (f_idx);
+          TRACE (TRACE_INT, "seek=%lld frames, ret=%lld", offset, read_frames);
           ASSERT (read_frames == offset);
           offset = JACK_MAX_FRAMES;
         }
         TRACE (TRACE_INT + 2, "toread=%lld frames", toread);
         read_frames = sf_read_float (infile [f_idx], wptr, toread);
-        if (disk_cancel_flag) {
-          TRACE (TRACE_DIAG, "read cancelled, exiting");
-          sf_close (infile [f_idx]);
-          ENSURE_SYSCALL (lseek, (infile_vio [f_idx].fd, 0, SEEK_SET));
-          infile [f_idx] = open_sf_fd_read (&infile_vio [f_idx], NULL);
-          pthread_exit (0);
-        }
+        disk_thread_chk_cancel_and_cleanup (f_idx);
         if (read_frames < toread) {
           TRACE (TRACE_INT, "Assuming end of seg, got %lld/%lld frames", read_frames, toread);
           seg_done = 1;
@@ -398,6 +418,12 @@ static void *disk_thread (void *dtarg_) {
         TRACE (TRACE_INT, "finished seg=%d", f_idx);
         ++f_idx;
         offset = 0;
+      }
+      if (f_idx == (nfiles - 1) && JACK_MAX_FRAMES != loop_start_frame) {
+        // last segment is configured to start at loop_pos_frame
+        offset += ftpos [f_idx];
+        f_idx = frame2file (&offset);
+        TRACE (TRACE_DIAG, "Looping to seg=%d, offset=%lld", f_idx, offset);
       }
     }
     TRACE (TRACE_INT + 1, "frag read");
@@ -471,43 +497,54 @@ static void manage_disk_threads () {
 static void setup_input_files () {
   ASSERT (nfiles > 0);
   infile_vio = malloc ((1 + nfiles) * sizeof (infile_vio [0]));
-  infile = malloc ((1 + nfiles) * sizeof (infile [0]));
+  infile = calloc (1, (1 + nfiles) * sizeof (infile [0]));
   ftpos = malloc ((1 + nfiles) * sizeof (ftpos [0]));
   ftpos [0] = 0;
-  for (unsigned i = 0; i < nfiles; ++i) {
-    ftpos [i + 1] = ftpos [i];
-    TRACE (TRACE_INT, "%s @%d",
-           fname [i] == NULL ? "*" : fname [i], ftpos [i]);
-    if (fname [i] == NULL) continue;
+  for (int i = 0; i < nfiles; ++i) {
+    ftpos [i + 1] = 0;
 
-    ENSURE_SYSCALL_AND_SAVE (open, (fname [i], O_RDONLY), infile_vio [i].fd);
-    {
-      struct stat buf;
-      ENSURE_SYSCALL (fstat, (infile_vio [i].fd, &buf));
-      infile_vio [i].sz = buf.st_size;
+    if (NULL != fname [i]) {
+      ENSURE_SYSCALL_AND_SAVE (open, (fname [i], O_RDONLY), infile_vio [i].fd);
+      {
+        struct stat buf;
+        ENSURE_SYSCALL (fstat, (infile_vio [i].fd, &buf));
+        infile_vio [i].sz = buf.st_size;
+      }
+      SF_INFO sf_info;
+      infile [i] = open_sf_fd_read (&infile_vio [i], &sf_info);
+      if (NULL == infile [i]) {
+        TRACE (TRACE_FATAL, "Could not open file %s: %s",
+               fname [i], sf_strerror (NULL));
+        myshutdown (1);
+      }
+      if (srate == 0) srate = sf_info.samplerate;
+      else if (srate != (unsigned) sf_info.samplerate) {
+        TRACE (TRACE_FATAL, "File %s has sample rate %d != %d for previous files",
+               fname [i], sf_info.samplerate, srate);
+        myshutdown (1);
+      }
+      if (0 == nports) nports = sf_info.channels;
+      else if (nports != (unsigned) sf_info.channels) {
+        TRACE (TRACE_FATAL, "File %s has # of channels %d != %d for previous files",
+               fname [i], sf_info.channels, nports);
+        myshutdown (1);
+      }
+      ftpos [i + 1] += sf_info.frames;
     }
-    SF_INFO sf_info;
-    infile [i] = open_sf_fd_read (&infile_vio [i], &sf_info);
-    if (NULL == infile [i]) {
-      TRACE (TRACE_FATAL, "Could not open file %s: %s",
-             fname [i], sf_strerror (NULL));
-      myshutdown (1);
-    }
-    if (srate == 0) srate = sf_info.samplerate;
-    else if (srate != (unsigned) sf_info.samplerate) {
-      TRACE (TRACE_FATAL, "File %s has sample rate %d != %d for previous files",
-             fname [i], sf_info.samplerate, srate);
-      myshutdown (1);
-    }
-    if (0 == nports) nports = sf_info.channels;
-    else if (nports != (unsigned) sf_info.channels) {
-      TRACE (TRACE_FATAL, "File %s has # of channels %d != %d for previous files",
-             fname [i], sf_info.channels, nports);
-      myshutdown (1);
-    }
-    ftpos [i + 1] += sf_info.frames;
+
+    if (0 != strcmp (ftpos_str [i], ":"))
+      ENSURE_CALL (convert_time, (ftpos_str [i], srate, &ftpos [i]) == 0);
+    ftpos [i + 1] += ftpos [i];
+    TRACE (TRACE_INT, "| %s @%u",
+           fname [i] == NULL ? "*" : fname [i], ftpos [i]);
   }
+
+  fname [nfiles] = NULL;
   ftpos [nfiles] = JACK_MAX_FRAMES;
+  ENSURE_CALL (convert_time, (loop_start_str, srate, &loop_start_frame) == 0);
+
+  if (loop_start_frame != JACK_MAX_FRAMES)
+    TRACE (TRACE_INT, "Loop goes back to frame=%u", loop_start_frame);
 }
 
 static void on_jack_shutdown (void *arg) {
@@ -602,9 +639,9 @@ NL "Options:"
 NL "  --cache SEC     Cache size; default: ~6s for 44.1 kHz stereo"
 NL "  --prefill PERC  Percentage of cache to prefill (default: 25%)"
 NL ""
-NL "Final LOOP option: [--pos LPOS] --loop T0 { T1 | : }"
-NL "  Repeats the T0-T1 segment from LPOS to infinity. LPOS defaults to the end"
-NL "  of the last file. T1, if given as ':', is also the end of the last file."
+NL "Final LOOP option: [--at LPOS] --loop T0"
+NL "  Repeats the T0-END segment from LPOS to infinity (where END is the"
+NL "  end of the last file)."
 NL ""
 NL "All positions can be given in seconds or samples (e.g. 480s)."
 NL ""
@@ -619,10 +656,12 @@ NL "Report bugs at https://github.com/danmbox/jack-file/issues"
 static void parse_args (char **argv) {
   if (argv [0] == NULL) usage (NULL);
 
-  unsigned nfiles_max = 100;
+  int nfiles_max = 100;
   fname = malloc (2 * nfiles_max * sizeof (fname [0]));
   ftpos_str = malloc (2 * nfiles_max * sizeof (ftpos [0]));
+  const char *loop_pos_str = NULL;
 
+  const char *pos_str = ":";
   for (++argv; *argv != NULL; ++argv) {
     if (*argv [0] == '-') {
       if (0 == strcmp (*argv, "-h") || 0 == strcmp (*argv, "--help") ||
@@ -632,10 +671,16 @@ static void parse_args (char **argv) {
       } else if (0 == strcmp (*argv, "--version")) {
         printf ("%s version %s\n%s\n", MYNAME, myrelease, "Copyright (C) 2011 Dan Muresan");
         exit (EXIT_SUCCESS);
+      } else if (0 == strcmp (*argv, "--at")) {
+        pos_str = *++argv;
       } else if (0 == strcmp (*argv, "-i")) {
         ASSERT (nfiles + 1 < nfiles_max);
-        ftpos_str [nfiles] = ":"; fname [nfiles++] = NULL;
-        ftpos_str [nfiles] = ":"; fname [nfiles++] = *++argv;
+        ftpos_str [nfiles] = ":"; fname [nfiles++] = NULL; // a gap
+        ftpos_str [nfiles] = pos_str; fname [nfiles++] = *++argv;
+        pos_str = ":";  // back to default
+      } else if (0 == strcmp (*argv, "--loop")) {
+        loop_start_str = *++argv;
+        loop_pos_str = pos_str; pos_str = ":";
       } else if (0 == strcmp (*argv, "--log-level")) {
         int l;
         if (sscanf (*++argv, "%d", &l) != 1)
@@ -652,6 +697,9 @@ static void parse_args (char **argv) {
     }
   }
   ftpos_str [nfiles] = ":"; fname [nfiles++] = NULL;
+  if (loop_start_str != NULL) {
+    ftpos_str [nfiles] = loop_pos_str; fname [nfiles++] = NULL;
+  }
 }
 
 static void init_trace () {
@@ -695,7 +743,11 @@ static void myshutdown (int failure) {
 
 static void sig_handler (int sig) {
   pthread_t self_tid = pthread_self ();
-  if (sig == SIGUSR2) { ASSERT (! pthread_equal (self_tid, main_tid)); return; }
+  if (sig == SIGUSR2) {  // we should be in a disk thread
+    ASSERT (! pthread_equal (self_tid, main_tid));
+    disk_cancel_flag = 1;
+    return;
+  }
 
   // We should be in the main thread -- all other threads block signals.
   // But linked libs could screw up our sigmask and handlers...

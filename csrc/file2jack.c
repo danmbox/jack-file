@@ -49,7 +49,7 @@ typedef struct {
 // configurable params
 int afterlife = 0;  ///< don't quit after Jack kills us
 int jbuf_frags = 0;  ///< Fragments / cache
-float prefill = 0.25;  ///< Cache prefill fraction
+float prefill = 0.1;  ///< Cache prefill fraction
 float cache_secs = 0.0;
 
 // internal vars
@@ -78,6 +78,7 @@ jack_nframes_t jperiodframes = JACK_MAX_FRAMES;  ///< Frames / Jack period
 
 /// Frame that Jack transport wants us to move to.
 jack_nframes_t relocate_frame = JACK_MAX_FRAMES;
+int reloc_countdown = 0;
 sem_t relocate_sem;  ///< Signals a transport relocation request
 sem_t disk_cancel_sem;
 
@@ -109,6 +110,14 @@ sample_t *jdata = NULL;
 jack_nframes_t jdatalen = 0;
 int player_ready = 0;  ///< Is relocation & cache prefilling complete?
 
+void post_relocation (jack_nframes_t frame) {
+  relocate_frame = frame + reloc_countdown * jperiodframes;
+  player_ready = 0;
+  ENSURE_SYSCALL (sem_post, (&relocate_sem)); ENSURE_SYSCALL (sem_post, (&relocate_sem));
+  jdata = NULL; jdatalen = 0;
+  TRACE (TRACE_INT, "Posting relocation to %u", relocate_frame);
+}
+
 /// Transport sync callback -- we are a slow-sync client.
 /// Executed in the process thread per Jack docs.
 static int on_jack_sync (jack_transport_state_t state, jack_position_t *pos, void *arg) {
@@ -117,12 +126,10 @@ static int on_jack_sync (jack_transport_state_t state, jack_position_t *pos, voi
   switch (state) {
   case JackTransportStopped:
   case JackTransportStarting: {
+    reloc_countdown = 0;
     if (relocate_frame != pos->frame) {
       player_ready = 0;
-      relocate_frame = pos->frame;
-      ENSURE_SYSCALL (sem_post, (&relocate_sem)); ENSURE_SYSCALL (sem_post, (&relocate_sem));
-      jdata = NULL; jdatalen = 0;
-      TRACE (TRACE_INT, "Relocate to %d", pos->frame);
+      post_relocation (pos->frame);
     } else {
       int semval;
       ENSURE_SYSCALL (sem_getvalue, (&relocate_sem, &semval));
@@ -135,12 +142,17 @@ static int on_jack_sync (jack_transport_state_t state, jack_position_t *pos, voi
     break;
   }
   case JackTransportRolling:
+    TRACE (TRACE_DIAG, "reloc_cnt=%d, reloc_frame=%u, pos->frame=%u", reloc_countdown, relocate_frame, pos->frame);
     player_ready = 0;
-    jack_transport_stop (jclient);
-    if (pos->frame != relocate_frame)
-      jack_transport_locate (jclient, pos->frame);
-    jack_transport_start (jclient);
-    TRACE (TRACE_WARN, "Slow-sync failed, forcing a stop/restart");
+    if (--reloc_countdown < 0) reloc_countdown = 0;
+    if (pos->frame != relocate_frame - reloc_countdown * jperiodframes) {
+      reloc_countdown = 1;
+      post_relocation (pos->frame);  // computes relocate_frame
+      jack_transport_stop (jclient);
+      jack_transport_locate (jclient, relocate_frame);
+      jack_transport_start (jclient);
+      TRACE (TRACE_WARN, "Slow-sync failed, forcing a stop/restart");
+    }
     break;
   default: ASSERT (0);
   }

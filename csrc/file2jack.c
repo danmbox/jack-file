@@ -394,7 +394,7 @@ static void *disk_thread (void *dtarg_) {
           offset = JACK_MAX_FRAMES;
         }
         TRACE (TRACE_INT + 2, "toread=%lld frames", toread);
-        read_frames = sf_read_float (infile [f_idx], wptr, toread);
+        read_frames = sf_readf_float (infile [f_idx], wptr, toread);
         disk_thread_chk_cancel_and_cleanup (f_idx);
         if (read_frames < toread) {
           TRACE (TRACE_INT, "Assuming end of seg, got %lld/%lld frames", read_frames, toread);

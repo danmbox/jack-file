@@ -529,6 +529,8 @@ static void setup_input_files () {
                fname [i], sf_info.channels, nports);
         myshutdown (1);
       }
+
+      ASSERT (1 == nports || 2 == nports);
       ftpos [i + 1] += sf_info.frames;
     }
 
@@ -562,13 +564,16 @@ static void compute_frames () {
   jperiodframes = jack_get_buffer_size (jclient);
   if (cache_secs > 0) jbuf_len = nports * srate * cache_secs + 0.5;
   else jbuf_len = (1 << 18) * nports;
+  jbuf = jack_ringbuffer_create (jbuf_len * sizeof (sample_t)); ASSERT (jbuf != NULL);
+  jack_ringbuffer_data_t jdatainfo [2];
+  jack_ringbuffer_get_write_vector (jbuf, jdatainfo);
+  jbuf_len = (jdatainfo [0].len + 1) / sizeof (sample_t);
   if (jbuf_frags < 4) {
-    jbuf_frags = jbuf_len / 0.25 / nports / srate;
-    if (jbuf_frags < 32) {  // ensure power of 2
-      int i = 4;
-      for (; i < jbuf_frags; i <<= 1);
-      jbuf_frags = i;
-    }
+    jbuf_frags = jbuf_len / 0.333 / nports / srate;
+    // ensure power of 2
+    int i = 4;
+    for (; i < jbuf_frags; i <<= 1);
+    jbuf_frags = i;
   }
   {  // fragment must contain integer # of periods
     jack_nframes_t denom = jperiodframes * nports * jbuf_frags;
@@ -595,12 +600,11 @@ static void setup_audio () {
   }
   compute_frames ();
 
-  jbuf = jack_ringbuffer_create (jbuf_len * sizeof (sample_t)); ASSERT (jbuf != NULL);
   ENSURE_SYSCALL (sem_init, (&jbuf_free_sem_store, 0, jbuf_free_max));
   jbuf_free_sem = &jbuf_free_sem_store;
 
-  TRACE (TRACE_INFO, "Connected to jack, period=%d, rate=%d, cache=%.3f sec, %d fragments",
-         (int) jperiodframes, (int) srate, (float) jbuf_len / (srate * nports), jbuf_frags);
+  TRACE (TRACE_INFO, "Connected to jack, period=%d, rate=%d, ports=%d, cache=%.3f sec (%d samples), %d fragments of %d frames",
+         (int) jperiodframes, (int) srate, nports, (float) jbuf_len / (srate * nports), jbuf_len, jbuf_frags, frag_frames);
 
   jport = malloc (nports * sizeof (jport [0]));
   for (unsigned i = 0; i < nports; ++i) {

@@ -56,7 +56,7 @@ float cache_secs = 0.0;
 sigset_t sigmask, sigusr2_mask;
 pthread_t poll_thread_tid;
 pthread_t main_tid;
-pthread_t disk_thread_tid [2];
+pthread_t disk_thread_tid [1];
 jack_nframes_t srate = 0;  ///< Sampling rate
 jack_client_t *jclient = NULL;
 sem_t zombified;
@@ -347,34 +347,46 @@ static int frame2file (sf_count_t *n) {
   ASSERT (0); return -1;
 }
 
-static void disk_thread_chk_cancel_and_cleanup (int f_idx) {
-  if (disk_cancel_flag) {
+static int disk_thread_chk_cancel_and_cleanup (int f_idx) {
+  if (! disk_cancel_flag) return 0;
+  else {
     disk_cancel_flag = 0;
     TRACE (TRACE_DIAG, "IO cancelled, exiting");
     sf_close (infile [f_idx]);
     ENSURE_SYSCALL (lseek, (infile_vio [f_idx].fd, 0, SEEK_SET));
     ENSURE_CALL_AND_SAVE (open_sf_fd_read, (&infile_vio [f_idx], NULL), infile [f_idx], NULL);
-    pthread_exit (0);
+    return 1;
   }
 }
 
 static void *disk_thread (void *dtarg_) {
   disk_thread_arg_t *dtarg = dtarg_;
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigusr2_mask, NULL));
+
+start: (void) 0;
 
   sf_count_t offset;
   ENSURE_SYSCALL (pthread_mutex_lock, (&dtarg->lock));
   while (dtarg->orig_frame == JACK_MAX_FRAMES)
     ENSURE_CALL (pthread_cond_wait, (&dtarg->cvar, &dtarg->lock));
   offset = dtarg->orig_frame;
+  ENSURE_SYSCALL (pthread_mutex_unlock, (&dtarg->lock));
+
+  jack_ringbuffer_reset (jbuf);
+  int semval;
+  ENSURE_SYSCALL (sem_getvalue, (jbuf_free_sem, &semval));
+  for (; semval < jbuf_free_max; ++semval)
+    sem_post (jbuf_free_sem);
+  disk_cancel_flag = 0;
+
+  ENSURE_SYSCALL (pthread_mutex_lock, (&dtarg->lock));
   dtarg->orig_frame = JACK_MAX_FRAMES;
+  ENSURE_CALL (pthread_cond_signal, (&dtarg->cvar));
   ENSURE_SYSCALL (pthread_mutex_unlock, (&dtarg->lock));
 
   int f_idx;
   f_idx = frame2file (&offset);
-  TRACE (TRACE_DIAG, "disk thread starting, seg=%d, offset=%lld", f_idx, offset);
-
-  disk_cancel_flag = 0;
-  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigusr2_mask, NULL));
+  TRACE (TRACE_DIAG, "disk thread restart, seg=%d, offset=%lld", f_idx, offset);
 
   for (;;) {
     // wait on semaphore, possibly cancelling on EINTR
@@ -382,9 +394,7 @@ static void *disk_thread (void *dtarg_) {
     int rc;
     while ((rc = sem_wait (jbuf_free_sem)) == -1) {
       ASSERT (EINTR == errno);
-      TRACE (TRACE_INT + 1, "sem_wait (jbuf) EINTR");
-      if (disk_cancel_flag)
-      { TRACE (TRACE_DIAG, "disk thread exiting"); pthread_exit (0); }
+      if (disk_cancel_flag) goto start;
       else continue;
     }
     TRACE (TRACE_INT + 2, "start frag");
@@ -400,14 +410,14 @@ static void *disk_thread (void *dtarg_) {
       if (infile [f_idx] != NULL) {  // file segment
         if (offset != JACK_MAX_FRAMES) {
           read_frames = sf_seek (infile [f_idx], offset, SEEK_SET);
-          disk_thread_chk_cancel_and_cleanup (f_idx);
+          if (disk_thread_chk_cancel_and_cleanup (f_idx)) goto start;
           TRACE (TRACE_INT, "seek=%lld frames, ret=%lld", offset, read_frames);
           ASSERT (read_frames == offset);
           offset = JACK_MAX_FRAMES;
         }
         TRACE (TRACE_INT + 2, "toread=%lld frames", toread);
         read_frames = sf_readf_float (infile [f_idx], wptr, toread);
-        disk_thread_chk_cancel_and_cleanup (f_idx);
+        if (disk_thread_chk_cancel_and_cleanup (f_idx)) goto start;
         if (read_frames < toread) {
           TRACE (TRACE_INT, "Assuming end of seg, got %lld/%lld frames", read_frames, toread);
           seg_done = 1;
@@ -455,54 +465,27 @@ static void signal_disk_thread (disk_thread_arg_t *dtarg) {
   TRACE (TRACE_INT, "Disk thread signalled");
 }
 
-/// Manages two disk threads -- one is active and one is a back-up.
-/// When the Jack transport skips, we cancel the active thread and signal the
-/// back-up thread to become active. This avoids having to wait for lengthy
-/// I/O to complete. A back-up thread is always ready and waiting, to avoid
-/// latency due to pthread_create().
 static void manage_disk_threads () {
-  disk_thread_arg_t dtarg [2];
-  for (unsigned i = 0; i < 2; ++i) {
-    ENSURE_SYSCALL (pthread_mutex_init, (&dtarg [i].lock, NULL));
-    ENSURE_SYSCALL (pthread_cond_init, (&dtarg [i].cvar, NULL));
-    dtarg [i].orig_frame = JACK_MAX_FRAMES;
-  }
+  disk_thread_arg_t dtarg [1];
+  ENSURE_SYSCALL (pthread_mutex_init, (&dtarg [0].lock, NULL));
+  ENSURE_SYSCALL (pthread_cond_init, (&dtarg [0].cvar, NULL));
+  dtarg [0].orig_frame = JACK_MAX_FRAMES;
 
-  ENSURE_SYSCALL (sem_wait, (&relocate_sem));  // or sem_init with -1...
-  for (;;) {
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
+  ENSURE_SYSCALL (pthread_create, (&disk_thread_tid [0], NULL, disk_thread, &dtarg [0]));
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
+
+  for (int first_time = 1; 1; first_time = 0) {
     ENSURE_SYSCALL (sem_wait, (&relocate_sem));
+    if (! first_time) pthread_kill (disk_thread_tid [0], SIGUSR2);
 
-    unsigned which = 0;
-    for (; which < 2; ++which)
-      if (! pthread_equal (disk_thread_tid [which], main_tid)) {
-        signal_disk_thread (&dtarg [which]);
-        break;
-      }
-    for (unsigned i = 0; i < 2; ++i)
-      if (pthread_equal (disk_thread_tid [i], main_tid)) {
-        ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
-        ENSURE_SYSCALL (pthread_create, (&disk_thread_tid [i], NULL, disk_thread, &dtarg [i]));
-        ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
-        TRACE (TRACE_DIAG, "New disk thread %d created", i);
-        if (which == 2) {
-          which = i;
-          signal_disk_thread (&dtarg [which]);
-        }
-      }
-    ASSERT (which != 2);
+    signal_disk_thread (&dtarg [0]);
+    ENSURE_SYSCALL (pthread_mutex_lock, (&dtarg->lock));
+    while (dtarg->orig_frame != JACK_MAX_FRAMES)
+      ENSURE_CALL (pthread_cond_wait, (&dtarg->cvar, &dtarg->lock));
+    ENSURE_SYSCALL (pthread_mutex_unlock, (&dtarg->lock));
 
     ENSURE_SYSCALL (sem_wait, (&relocate_sem));
-    TRACE (TRACE_DIAG, "Cancelling active disk thread %d", which);
-    ENSURE_SYSCALL (sem_post, (&disk_cancel_sem));
-    pthread_kill (disk_thread_tid [which], SIGUSR2);
-    void *rc; ENSURE_SYSCALL (pthread_join, (disk_thread_tid [which], &rc));
-    disk_thread_tid [which] = main_tid;
-
-    jack_ringbuffer_reset (jbuf);
-    int semval;
-    ENSURE_SYSCALL (sem_getvalue, (jbuf_free_sem, &semval));
-    for (; semval < jbuf_free_max; ++semval)
-      sem_post (jbuf_free_sem);
   }
 }
 
@@ -653,7 +636,7 @@ NL "  or:  " MYNAME " { -h | --help | -? | --version }"
 NL ""
 NL "Options:"
 NL "  --cache SEC     Cache size; default: ~6s for 44.1 kHz stereo"
-NL "  --prefill PERC  Percentage of cache to prefill (default: 25%)"
+NL "  --prefill PERC  Percentage of cache to prefill (default: 10%)"
 NL ""
 NL "Final LOOP option: [--at LPOS] --loop T0"
 NL "  Repeats the T0-END segment from LPOS to infinity (where END is the"
@@ -719,7 +702,7 @@ static void parse_args (char **argv) {
 }
 
 static void init_trace () {
-  trace_buf = memfile_alloc (1 << 12);
+  trace_buf = memfile_alloc (1 << 16);
   stdtrace = fdopen (dup (fileno (stdout)), "w");
   setvbuf (stdtrace, NULL, _IONBF, 0);
   TRACE (TRACE_INFO, "Logging enabled, level=%d", (int) trace_level);
@@ -730,8 +713,7 @@ static void cleanup () {
   if (0 == sem_getvalue (&zombified, &z) && z > 0)
     TRACE (TRACE_FATAL, "Jack shut us down");
   pthread_cancel_and_join_if_started (poll_thread_tid, main_tid);
-  for (unsigned i = 0; i < 2; ++i)
-    pthread_cancel_and_join_if_started (disk_thread_tid [i], main_tid);
+  pthread_cancel_and_join_if_started (disk_thread_tid [0], main_tid);
   if (jclient != NULL) {
     if (z == 0) sem_post (&zombified);  // main already knows about it, signal others
     jack_client_close (jclient);
@@ -786,8 +768,7 @@ static void sig_handler (int sig) {
 static void init_globals () {
   main_tid = pthread_self ();
   poll_thread_tid = main_tid;
-  for (unsigned i = 0; i < 2; ++i)
-    disk_thread_tid [i] = main_tid;
+  disk_thread_tid [0] = main_tid;
   ENSURE_SYSCALL (sigemptyset, (&sigmask));
   ENSURE_SYSCALL (sigemptyset, (&sigusr2_mask));
   ENSURE_SYSCALL (sem_init, (&zombified, 0, 0));

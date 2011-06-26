@@ -49,8 +49,8 @@ typedef struct {
 // configurable params
 int afterlife = 0;  ///< don't quit after Jack kills us
 int jbuf_frags = 0;  ///< Fragments / cache
-float prefill = 0.1;  ///< Cache prefill fraction
 float cache_secs = 0.0;
+float soft_vol = 100.0;
 
 // internal vars
 sigset_t sigmask, sigusr2_mask;
@@ -80,7 +80,6 @@ jack_nframes_t jperiodframes = JACK_MAX_FRAMES;  ///< Frames / Jack period
 jack_nframes_t relocate_frame = JACK_MAX_FRAMES;
 int reloc_countdown = 0;
 sem_t relocate_sem;  ///< Signals a transport relocation request
-sem_t disk_cancel_sem;
 
 int nfiles = 0;
 const char **fname = NULL;  ///< Names of input files
@@ -136,7 +135,7 @@ static int on_jack_sync (jack_transport_state_t state, jack_position_t *pos, voi
       if (semval != 0) player_ready = 0;
       else {
         ENSURE_SYSCALL (sem_getvalue, (jbuf_free_sem, &semval));
-        player_ready = ((float) ((jbuf_free_max - semval) / 2)) / (jbuf_free_max / 2) >= prefill;
+        player_ready = ((float) ((jbuf_free_max - semval) / 2)) >= 1;
       }
     }
     break;
@@ -213,7 +212,7 @@ static void *process_thread (void *arg) {
       // un-interleave samples
       for (jack_nframes_t f = 0; f < nframes; ++f)
         for (unsigned i = 0; i < nports; ++i)
-          jportbuf [i] [f] = jdata [f * nports + i];
+          jportbuf [i] [f] = soft_vol / 100.0 * jdata [f * nports + i];
       jdata += nframes * nports;
       jdatalen -= nframes;
     }
@@ -636,7 +635,7 @@ NL "  or:  " MYNAME " { -h | --help | -? | --version }"
 NL ""
 NL "Options:"
 NL "  --cache SEC     Cache size; default: ~6s for 44.1 kHz stereo"
-NL "  --prefill PERC  Percentage of cache to prefill (default: 10%)"
+NL "  --vol PERC      Soft volume (can be greater than 100%)"
 NL ""
 NL "Final LOOP option: [--at LPOS] --loop T0"
 NL "  Repeats the T0-END segment from LPOS to infinity (where END is the"
@@ -653,6 +652,7 @@ NL "Report bugs at https://github.com/danmbox/jack-file/issues"
 }
 
 static void parse_args (char **argv) {
+  char extra;
   if (argv [0] == NULL) usage (NULL);
 
   int nfiles_max = 100;
@@ -680,6 +680,12 @@ static void parse_args (char **argv) {
       } else if (0 == strcmp (*argv, "--loop")) {
         loop_start_str = *++argv;
         loop_pos_str = pos_str; pos_str = ":";
+      } else if (0 == strcmp (*argv, "--vol")) {
+        if (sscanf (*++argv, "%f%c", &soft_vol, &extra) != 1)
+          usage ("Bad soft volume %s", *argv);
+      } else if (0 == strcmp (*argv, "--cache")) {
+        if (sscanf (*++argv, "%f%c", &cache_secs, &extra) != 1)
+          usage ("Bad cache size %s", *argv);
       } else if (0 == strcmp (*argv, "--log-level")) {
         int l;
         if (sscanf (*++argv, "%d", &l) != 1)
@@ -773,7 +779,6 @@ static void init_globals () {
   ENSURE_SYSCALL (sigemptyset, (&sigusr2_mask));
   ENSURE_SYSCALL (sem_init, (&zombified, 0, 0));
   ENSURE_SYSCALL (sem_init, (&relocate_sem, 0, 0));
-  ENSURE_SYSCALL (sem_init, (&disk_cancel_sem, 0, 0));
 }
 
 int main (int argc, char **argv) {

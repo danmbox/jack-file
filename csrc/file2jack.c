@@ -35,11 +35,6 @@ const char myrelease [] =
 typedef jack_default_audio_sample_t sample_t;
 
 // other types
-typedef struct {
-  jack_nframes_t orig_frame;
-  pthread_cond_t cvar;
-  pthread_mutex_t lock;
-} disk_thread_arg_t;
 
 typedef struct {
   int fd;
@@ -111,8 +106,10 @@ int player_ready = 0;  ///< Is relocation & cache prefilling complete?
 
 void post_relocation (jack_nframes_t frame) {
   relocate_frame = frame + reloc_countdown * jperiodframes;
+  ASSERT (! pthread_equal (main_tid, disk_thread_tid [0]));
+  ENSURE_SYSCALL (pthread_kill, (disk_thread_tid [0], SIGUSR2));
   player_ready = 0;
-  ENSURE_SYSCALL (sem_post, (&relocate_sem)); ENSURE_SYSCALL (sem_post, (&relocate_sem));
+  ENSURE_SYSCALL (sem_post, (&relocate_sem));
   jdata = NULL; jdatalen = 0;
   TRACE (TRACE_INT, "Posting relocation to %u", relocate_frame);
 }
@@ -122,29 +119,32 @@ void post_relocation (jack_nframes_t frame) {
 static int on_jack_sync (jack_transport_state_t state, jack_position_t *pos, void *arg) {
   (void) arg;
 
+  int semval;
+  ENSURE_SYSCALL (sem_getvalue, (&relocate_sem, &semval));
+  if (semval != 0) player_ready = 0;
+  reloc_countdown = 0;
+
   switch (state) {
   case JackTransportStopped:
   case JackTransportStarting: {
-    reloc_countdown = 0;
     if (relocate_frame != pos->frame) {
       player_ready = 0;
-      post_relocation (pos->frame);
+      if (semval == 0)
+        post_relocation (pos->frame);
     } else {
-      int semval;
-      ENSURE_SYSCALL (sem_getvalue, (&relocate_sem, &semval));
-      if (semval != 0) player_ready = 0;
-      else {
-        ENSURE_SYSCALL (sem_getvalue, (jbuf_free_sem, &semval));
-        player_ready = ((float) ((jbuf_free_max - semval) / 2)) >= 1;
+      if (semval == 0) {
+        int semval2;
+        ENSURE_SYSCALL (sem_getvalue, (jbuf_free_sem, &semval2));
+        player_ready = ((float) ((jbuf_free_max - semval2) / 2)) >= 1;
       }
     }
     break;
   }
   case JackTransportRolling:
-    TRACE (TRACE_DIAG, "reloc_cnt=%d, reloc_frame=%u, pos->frame=%u", reloc_countdown, relocate_frame, pos->frame);
+    TRACE (TRACE_DIAG, "rolling, reloc_cnt=%d, reloc_frame=%u, pos->frame=%u", reloc_countdown, relocate_frame, pos->frame);
     player_ready = 0;
     if (--reloc_countdown < 0) reloc_countdown = 0;
-    if (pos->frame != relocate_frame - reloc_countdown * jperiodframes) {
+    if (semval == 0 && pos->frame != relocate_frame - reloc_countdown * jperiodframes) {
       reloc_countdown = 1;
       post_relocation (pos->frame);  // computes relocate_frame
       jack_transport_stop (jclient);
@@ -240,7 +240,7 @@ static void *poll_thread (void *arg) {
 }
 
 /// Flag set by virtual I/O functions
-volatile int disk_cancel_flag = 0;
+volatile sig_atomic_t disk_cancel_flag = 0;
 
 sf_count_t  mysf_vio_get_filelen (void *user_data) {
   return ((mysf_vio_data *) user_data)->sz;
@@ -330,6 +330,8 @@ static SNDFILE *open_sf_fd_read (mysf_vio_data *data, SF_INFO *sf_info) {
 }
 
 static int frame2file (sf_count_t *n) {
+  ASSERT (*n != JACK_MAX_FRAMES);
+
   for (int i = 0; i < nfiles; ++i)
     if (*n < ftpos [i + 1]) {
       if (JACK_MAX_FRAMES == loop_start_frame || *n < ftpos [nfiles - 1]) {
@@ -343,6 +345,7 @@ static int frame2file (sf_count_t *n) {
       return frame2file (n);
     }
 
+  TRACE (TRACE_FATAL, "Could not find frame=%llu, nfiles=%d", *n, nfiles);
   ASSERT (0); return -1;
 }
 
@@ -350,7 +353,7 @@ static int disk_thread_chk_cancel_and_cleanup (int f_idx) {
   if (! disk_cancel_flag) return 0;
   else {
     disk_cancel_flag = 0;
-    TRACE (TRACE_DIAG, "IO cancelled, exiting");
+    TRACE (TRACE_DIAG, "IO cancelled, restarting");
     sf_close (infile [f_idx]);
     ENSURE_SYSCALL (lseek, (infile_vio [f_idx].fd, 0, SEEK_SET));
     ENSURE_CALL_AND_SAVE (open_sf_fd_read, (&infile_vio [f_idx], NULL), infile [f_idx], NULL);
@@ -358,30 +361,32 @@ static int disk_thread_chk_cancel_and_cleanup (int f_idx) {
   }
 }
 
-static void *disk_thread (void *dtarg_) {
-  disk_thread_arg_t *dtarg = dtarg_;
-  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigusr2_mask, NULL));
+static void *disk_thread (void *dtarg) {
+  (void) dtarg;
 
-start: (void) 0;
+  {
+    sigset_t nonusr2_mask; ENSURE_SYSCALL (sigfillset, (&nonusr2_mask));
+    sigdelset (&nonusr2_mask, SIGUSR2);
+    ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigusr2_mask, NULL));
+    while (! disk_cancel_flag)
+      sigsuspend (&nonusr2_mask);
+    TRACE (TRACE_DIAG, "Disk thread: got initial signal");
+    ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigusr2_mask, NULL));
+ }
 
-  sf_count_t offset;
-  ENSURE_SYSCALL (pthread_mutex_lock, (&dtarg->lock));
-  while (dtarg->orig_frame == JACK_MAX_FRAMES)
-    ENSURE_CALL (pthread_cond_wait, (&dtarg->cvar, &dtarg->lock));
-  offset = dtarg->orig_frame;
-  ENSURE_SYSCALL (pthread_mutex_unlock, (&dtarg->lock));
-
+restart: (void) 0;
   jack_ringbuffer_reset (jbuf);
   int semval;
   ENSURE_SYSCALL (sem_getvalue, (jbuf_free_sem, &semval));
   for (; semval < jbuf_free_max; ++semval)
     sem_post (jbuf_free_sem);
-  disk_cancel_flag = 0;
 
-  ENSURE_SYSCALL (pthread_mutex_lock, (&dtarg->lock));
-  dtarg->orig_frame = JACK_MAX_FRAMES;
-  ENSURE_CALL (pthread_cond_signal, (&dtarg->cvar));
-  ENSURE_SYSCALL (pthread_mutex_unlock, (&dtarg->lock));
+  sf_count_t offset;
+  offset = relocate_frame;
+
+  disk_cancel_flag = 0;
+  TRACE (TRACE_INT, "Releasing relocation semaphore");
+  ENSURE_SYSCALL (sem_wait, (&relocate_sem));
 
   int f_idx;
   f_idx = frame2file (&offset);
@@ -393,7 +398,7 @@ start: (void) 0;
     int rc;
     while ((rc = sem_wait (jbuf_free_sem)) == -1) {
       ASSERT (EINTR == errno);
-      if (disk_cancel_flag) goto start;
+      if (disk_cancel_flag) goto restart;
       else continue;
     }
     TRACE (TRACE_INT + 2, "start frag");
@@ -409,14 +414,14 @@ start: (void) 0;
       if (infile [f_idx] != NULL) {  // file segment
         if (offset != JACK_MAX_FRAMES) {
           read_frames = sf_seek (infile [f_idx], offset, SEEK_SET);
-          if (disk_thread_chk_cancel_and_cleanup (f_idx)) goto start;
+          if (disk_thread_chk_cancel_and_cleanup (f_idx)) goto restart;
           TRACE (TRACE_INT, "seek=%lld frames, ret=%lld", offset, read_frames);
           ASSERT (read_frames == offset);
           offset = JACK_MAX_FRAMES;
         }
         TRACE (TRACE_INT + 2, "toread=%lld frames", toread);
         read_frames = sf_readf_float (infile [f_idx], wptr, toread);
-        if (disk_thread_chk_cancel_and_cleanup (f_idx)) goto start;
+        if (disk_thread_chk_cancel_and_cleanup (f_idx)) goto restart;
         if (read_frames < toread) {
           TRACE (TRACE_INT, "Assuming end of seg, got %lld/%lld frames", read_frames, toread);
           seg_done = 1;
@@ -455,37 +460,11 @@ start: (void) 0;
   return NULL;
 }
 
-static void signal_disk_thread (disk_thread_arg_t *dtarg) {
-  ENSURE_CALL (pthread_mutex_lock, (&dtarg->lock));
-  ASSERT (JACK_MAX_FRAMES == dtarg->orig_frame);
-  dtarg->orig_frame = relocate_frame;
-  ENSURE_CALL (pthread_cond_signal, (&dtarg->cvar));
-  ENSURE_CALL (pthread_mutex_unlock, (&dtarg->lock));
-  TRACE (TRACE_INT, "Disk thread signalled");
-}
-
-static void manage_disk_threads () {
-  disk_thread_arg_t dtarg [1];
-  ENSURE_SYSCALL (pthread_mutex_init, (&dtarg [0].lock, NULL));
-  ENSURE_SYSCALL (pthread_cond_init, (&dtarg [0].cvar, NULL));
-  dtarg [0].orig_frame = JACK_MAX_FRAMES;
-
-  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
-  ENSURE_SYSCALL (pthread_create, (&disk_thread_tid [0], NULL, disk_thread, &dtarg [0]));
-  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
-
-  for (int first_time = 1; 1; first_time = 0) {
-    ENSURE_SYSCALL (sem_wait, (&relocate_sem));
-    if (! first_time) pthread_kill (disk_thread_tid [0], SIGUSR2);
-
-    signal_disk_thread (&dtarg [0]);
-    ENSURE_SYSCALL (pthread_mutex_lock, (&dtarg->lock));
-    while (dtarg->orig_frame != JACK_MAX_FRAMES)
-      ENSURE_CALL (pthread_cond_wait, (&dtarg->cvar, &dtarg->lock));
-    ENSURE_SYSCALL (pthread_mutex_unlock, (&dtarg->lock));
-
-    ENSURE_SYSCALL (sem_wait, (&relocate_sem));
-  }
+static void create_disk_thread () {
+  sigset_t oldmask;
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, &oldmask));
+  ENSURE_SYSCALL (pthread_create, (&disk_thread_tid [0], NULL, disk_thread, NULL));
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_SETMASK, &oldmask, NULL));
 }
 
 static void setup_input_files () {
@@ -611,6 +590,8 @@ static void setup_audio () {
   ENSURE_CALL (jack_set_process_thread, (jclient, process_thread, NULL) != 0);
 
   ENSURE_CALL (jack_set_sync_callback, (jclient, on_jack_sync, NULL) != 0);
+
+  create_disk_thread ();
 
   ENSURE_CALL (jack_activate, (jclient) != 0);
 
@@ -757,7 +738,7 @@ static void sig_handler (int sig) {
   // But linked libs could screw up our sigmask and handlers...
   if (! pthread_equal (self_tid, main_tid)) {
     TRACE (TRACE_WARN, "Signal %d redirected to main thread", sig);
-    pthread_kill (main_tid, sig); for (;;) pause ();
+    ENSURE_SYSCALL (pthread_kill, (main_tid, sig)); for (;;) pause ();
   }
   if (sig == SIGPIPE) return;  // we don't do pipes
   TRACE (TRACE_INFO, "Caught signal %d", sig);
@@ -766,7 +747,7 @@ static void sig_handler (int sig) {
     { .sa_mask = sigmask, .sa_flags = 0, .sa_handler = SIG_DFL };
   sigaction (sig, &act, NULL);
   pthread_sigmask (SIG_UNBLOCK, &sigmask, NULL);
-  pthread_kill (pthread_self (), sig);
+  ENSURE_SYSCALL (pthread_kill, (pthread_self (), sig));
 }
 
 /// Initializes variables and resources that cannot be initialized statically.
@@ -808,7 +789,7 @@ int main (int argc, char **argv) {
   setup_audio ();
   ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
 
-  manage_disk_threads ();
+  for (;;) pause ();
 
   myshutdown (0); assert (0);
 }

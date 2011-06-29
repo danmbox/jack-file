@@ -1,27 +1,28 @@
-<!DOCTYPE html>
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+
 <html>
 <head>
-  <meta charset='utf-8'>
+<meta http-equiv="Content-Type" content= "text/html; charset=us-ascii">
 
   <title>danmbox/jack-file @ GitHub</title>
 
-  <style type="text/css">
+  <style type="text/css"> 
     body {
       margin-top: 1.0em;
-      background-color: #1334a8;
+      background-color: #ffffff;
       font-family: Helvetica, Arial, FreeSans, san-serif;
-      color: #ffffff;
+      color: #000000;
     }
     #container {
       margin: 0 auto;
       width: 700px;
     }
-    h1 { font-size: 3.8em; color: #eccb57; margin-bottom: 3px; }
+    h1 { font-size: 3.8em; color: #104d0e; margin-bottom: 3px; }
     h1 .small { font-size: 0.4em; }
     h1 a { text-decoration: none }
-    h2 { font-size: 1.5em; color: #eccb57; }
-    h3 { text-align: center; color: #eccb57; }
-    a { color: #eccb57; }
+    h2 { font-size: 1.5em; color: #104d0e; }
+    h3 { text-align: center; color: #104d0e; }
+    a { color: #104d0e; }
     .description { font-size: 1.2em; margin-bottom: 30px; margin-top: 30px; font-style: italic;}
     .download { float: right; }
     pre { background: #000; color: #fff; padding: 15px;}
@@ -37,20 +38,53 @@
 
     <div class="download">
       <a href="http://github.com/danmbox/jack-file/zipball/master">
-        <img border="0" width="90" src="http://github.com/images/modules/download/zip.png"></a>
+        <img alt="" border="0" width="90" src="http://github.com/images/modules/download/zip.png"></a>
       <a href="http://github.com/danmbox/jack-file/tarball/master">
-        <img border="0" width="90" src="http://github.com/images/modules/download/tar.png"></a>
+        <img alt="" border="0" width="90" src="http://github.com/images/modules/download/tar.png"></a>
     </div>
 
     <h1><a href="http://github.com/danmbox/jack-file">jack-file</a>
-      <span class="small">by <a href="http://github.com/danmbox">danmbox</a></span></h1>
+      <span class="small">by <a href="http://github.com/danmbox">Dan A. Muresan</a></span></h1>
 
     <div class="description">
       Jack transport-centric utilities for audio playback
     </div>
 
-    <h2>Authors</h2>
-<p>Dan A. Muresan (danmbox@gmail.com)<br/><br/>      </p>
+<p>Jack-File contains two utilities for Jack transport-bound playback:</p>
+<p>file2jack is a gapless audio player that maps files onto the
+(optionally periodic) transport timeline. The player achieves
+periodicty (looping) without moving the transport: the looped segments
+are simply mapped to transport time-points. A picture is worth 10^n
+words:</p>
+
+<pre>
+|*****| FILE A | FILE B |******| FILE C | FILE C | FILE C | ...
+----------------------------------------------------------------
+      |        |        |      |        |        |        |
+     10s      20s      30s    40s      50s      60s      70s
+
+file2jack --at 10 -i A.flac --at 20 -i B.flac --at 40 -i C.flac --loop 40
+        </pre>
+        
+<p>In the example above (which assumes files A, B, C are all 10s long) the
+user has requested 10s of silence, then FILE A at 10s, then FILE B at
+20s, then after 10 more seconds of silence, FILE C repeated
+periodically from 40s to infinity evert 10s.</p>
+
+<p>jacktransportloop is a simpler way to loop other transport-aware
+players: it forces the Jack transport to loop between two time-points.
+When the transport reaches the loop endpoint, it is forced back to the
+starting point. This will loop any transport-aware player, but
+compared to file2jack it will create playback a gap at the loop
+endpoint.</p>
+
+<p>See README.txt in the distribution for more information.</p>
+
+<h2>License</h2> 
+<a href="https://github.com/danmbox/shut-audio-tools/issues">Apache License, Version 2.0</a>
+      
+<h2>Authors</h2>
+<p>Dan A. Muresan (danmbox@gmail.com)</p>
 
 
     <h2>Download</h2>
@@ -60,9 +94,8 @@
       <a href="http://github.com/danmbox/jack-file/tarball/master">tar</a> formats.
     </p>
     <p>You can also clone the project with <a href="http://git-scm.com">Git</a>
-      by running:
+      by running:</p>
       <pre>$ git clone git://github.com/danmbox/jack-file</pre>
-    </p>
 
     <div class="footer">
       get the source code on GitHub : <a href="http://github.com/danmbox/jack-file">danmbox/jack-file</a>

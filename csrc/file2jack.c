@@ -72,9 +72,12 @@ jack_nframes_t frag_frames = JACK_MAX_FRAMES;  ///< Frames / fragment
 jack_nframes_t jperiodframes = JACK_MAX_FRAMES;  ///< Frames / Jack period
 
 /// Frame that Jack transport wants us to move to.
-jack_nframes_t relocate_frame = JACK_MAX_FRAMES;
+jack_nframes_t reloc_frame = JACK_MAX_FRAMES;
+/// Jack periods left till target transport frame is reached
 int reloc_countdown = 0;
-sem_t relocate_sem;  ///< Signals a transport relocation request
+/// Lock for @p reloc_frame
+pthread_mutex_t reloc_lock = PTHREAD_MUTEX_INITIALIZER;
+int reloc_pending = 0;  ///< 1 if a transport relocation request is pending
 
 int nfiles = 0;
 const char **fname = NULL;  ///< Names of input files
@@ -104,14 +107,49 @@ sample_t *jdata = NULL;
 jack_nframes_t jdatalen = 0;
 int player_ready = 0;  ///< Is relocation & cache prefilling complete?
 
-void post_relocation (jack_nframes_t frame) {
-  relocate_frame = frame + reloc_countdown * jperiodframes;
-  ASSERT (! pthread_equal (main_tid, disk_thread_tid [0]));
-  ENSURE_SYSCALL (pthread_kill, (disk_thread_tid [0], SIGUSR2));
-  player_ready = 0;
-  ENSURE_SYSCALL (sem_post, (&relocate_sem));
-  jdata = NULL; jdatalen = 0;
-  TRACE (TRACE_INT, "Posting relocation to %u", relocate_frame);
+/// Attempts to post a relocation request (if necessary).
+/// If sucessful, computes @c reloc_frame based on @c reloc_countdown.
+/// @return target frame; JACK_MAX_FRAMES for temporary failure, or when relocation isn't necessary
+jack_nframes_t post_relocation (jack_nframes_t frame) {
+  jack_nframes_t target_frame = frame + reloc_countdown * jperiodframes;
+
+  if (0 == pthread_mutex_trylock (&reloc_lock)) {
+    if (reloc_frame == target_frame) {
+      if (reloc_pending) player_ready = 0;
+      else {
+        int semval2;
+        ENSURE_SYSCALL (sem_getvalue, (jbuf_free_sem, &semval2));
+        // start when 1 fragment is ready
+        player_ready = ((float) ((jbuf_free_max - semval2) / 2)) >= 1;
+        if (player_ready) reloc_frame = JACK_MAX_FRAMES;
+      }
+      ENSURE_SYSCALL (pthread_mutex_unlock, (&reloc_lock));
+      TRACE (TRACE_INT, "Repeated relocation, target=%u, ready=%d", target_frame, player_ready);
+      return JACK_MAX_FRAMES;
+    } else {  // reloc_frame != target_frame
+      int signalled = 0;
+      player_ready = 0;
+      reloc_frame = target_frame;
+      if (! reloc_pending) {  // signal disk thread
+        ASSERT (! pthread_equal (main_tid, disk_thread_tid [0]));
+        ENSURE_SYSCALL (pthread_kill, (disk_thread_tid [0], SIGUSR2));
+        signalled = 1;
+        reloc_pending = 1;
+      }
+      ENSURE_SYSCALL (pthread_mutex_unlock, (&reloc_lock));
+
+      jdata = NULL; jdatalen = 0;
+      TRACE (TRACE_INT, "Posted relocation to %u%s", target_frame,
+             signalled ? " & signalled" : "");
+      return target_frame;
+    }
+  } else {
+    TRACE_PERROR (TRACE_INT, "Couldn't obtain lock -- deferred till next period");
+    // Couldn't lock @c reloc_lock -- disk thread is using it.
+    // We'll have to retry during the next Jack cycle.
+    player_ready = 0;
+    return JACK_MAX_FRAMES;
+  }
 }
 
 /// Transport sync callback -- we are a slow-sync client.
@@ -119,46 +157,32 @@ void post_relocation (jack_nframes_t frame) {
 static int on_jack_sync (jack_transport_state_t state, jack_position_t *pos, void *arg) {
   (void) arg;
 
-  int semval;
-  ENSURE_SYSCALL (sem_getvalue, (&relocate_sem, &semval));
-  if (semval != 0) player_ready = 0;
-  reloc_countdown = 0;
-
   switch (state) {
   case JackTransportStopped:
-  case JackTransportStarting: {
-    if (relocate_frame != pos->frame) {
-      player_ready = 0;
-      if (semval == 0)
-        post_relocation (pos->frame);
-    } else {
-      if (semval == 0) {
-        int semval2;
-        ENSURE_SYSCALL (sem_getvalue, (jbuf_free_sem, &semval2));
-        player_ready = ((float) ((jbuf_free_max - semval2) / 2)) >= 1;
-      }
-    }
-    break;
-  }
-  case JackTransportRolling:
-    TRACE (TRACE_DIAG, "rolling, reloc_cnt=%d, reloc_frame=%u, pos->frame=%u", reloc_countdown, relocate_frame, pos->frame);
     player_ready = 0;
-    if (--reloc_countdown < 0) reloc_countdown = 0;
-    if (semval == 0 && pos->frame != relocate_frame - reloc_countdown * jperiodframes) {
-      reloc_countdown = 1;
-      post_relocation (pos->frame);  // computes relocate_frame
-      jack_transport_stop (jclient);
-      jack_transport_locate (jclient, relocate_frame);
-      jack_transport_start (jclient);
-      TRACE (TRACE_WARN, "Slow-sync failed, forcing a stop/restart");
+  case JackTransportStarting:
+    reloc_countdown = 0;
+    post_relocation (pos->frame);
+    TRACE (TRACE_INT, "start/stop, frame=%u", pos->frame);
+    break;
+  case JackTransportRolling:
+    if (--reloc_countdown < 0) {
+      reloc_countdown = 2;
+      jack_nframes_t target = post_relocation (pos->frame);
+      if (target == JACK_MAX_FRAMES) reloc_countdown = 0;
+      else {
+        jack_transport_stop (jclient);
+        jack_transport_locate (jclient, target);
+        jack_transport_start (jclient);
+        TRACE (TRACE_WARN, "Slow-sync failed, forcing a stop/restart to %u", target);
+      }
     }
     break;
   default: ASSERT (0);
   }
 
   if (player_ready) {
-    relocate_frame = JACK_MAX_FRAMES;
-    TRACE (TRACE_DIAG, "Transport relocation completed");
+    TRACE (TRACE_DIAG, "Transport relocation completed @%u", pos->frame);
   }
   return player_ready;
 }
@@ -277,7 +301,7 @@ static sf_count_t mysf_vio_rw (void *ptr, sf_count_t count, mysf_vio_data *data,
 
   while (done < count) {
     if (disk_cancel_flag) {
-      TRACE (TRACE_DIAG, "IO cancelled, returning short count");
+      TRACE (TRACE_INT + 1, "IO cancelled, returning short count");
       return 0;  // cause decoder to exit ASAP
 #if 0  // fake a successful read; still causes un-clearable decoder errors
       off_t cur = lseek (data->fd, 0, SEEK_CUR);
@@ -353,7 +377,7 @@ static int disk_thread_chk_cancel_and_cleanup (int f_idx) {
   if (! disk_cancel_flag) return 0;
   else {
     disk_cancel_flag = 0;
-    TRACE (TRACE_DIAG, "IO cancelled, restarting");
+    TRACE (TRACE_INT, "IO cancelled, restarting");
     sf_close (infile [f_idx]);
     ENSURE_SYSCALL (lseek, (infile_vio [f_idx].fd, 0, SEEK_SET));
     ENSURE_CALL_AND_SAVE (open_sf_fd_read, (&infile_vio [f_idx], NULL), infile [f_idx], NULL);
@@ -382,15 +406,16 @@ restart: (void) 0;
     sem_post (jbuf_free_sem);
 
   sf_count_t offset;
-  offset = relocate_frame;
 
+  ENSURE_SYSCALL (pthread_mutex_lock, (&reloc_lock));
   disk_cancel_flag = 0;
-  TRACE (TRACE_INT, "Releasing relocation semaphore");
-  ENSURE_SYSCALL (sem_wait, (&relocate_sem));
+  offset = reloc_frame;
+  reloc_pending = 0;
+  ENSURE_SYSCALL (pthread_mutex_unlock, (&reloc_lock));
 
   int f_idx;
   f_idx = frame2file (&offset);
-  TRACE (TRACE_DIAG, "disk thread restart, seg=%d, offset=%lld", f_idx, offset);
+  TRACE (TRACE_INT, "disk thread restart, seg=%d, offset=%lld", f_idx, offset);
 
   for (;;) {
     // wait on semaphore, possibly cancelling on EINTR
@@ -759,7 +784,6 @@ static void init_globals () {
   ENSURE_SYSCALL (sigemptyset, (&sigmask));
   ENSURE_SYSCALL (sigemptyset, (&sigusr2_mask));
   ENSURE_SYSCALL (sem_init, (&zombified, 0, 0));
-  ENSURE_SYSCALL (sem_init, (&relocate_sem, 0, 0));
 }
 
 int main (int argc, char **argv) {

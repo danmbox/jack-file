@@ -91,11 +91,6 @@ unsigned loop_start_file = -1;
 pthread_mutex_t files_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
-// --- UTILS ---
-
-// --- END UTILS ---
-
-
 // --- PROGRAM ---
 
 static void myshutdown (int failure);
@@ -353,6 +348,8 @@ static SNDFILE *open_sf_fd_read (mysf_vio_data *data, SF_INFO *sf_info) {
   return sf_open_virtual (&mysf_vio, SFM_READ, sf_info, data);
 }
 
+/// Converts a frame number to a segment + an offset.
+/// @return Segment index; offset in segment overwrites *n
 static int frame2file (sf_count_t *n) {
   ASSERT (*n != JACK_MAX_FRAMES);
 
@@ -373,6 +370,9 @@ static int frame2file (sf_count_t *n) {
   ASSERT (0); return -1;
 }
 
+
+/// Checks the cancellation flag, and if necessary re-opens the SNDFILE structre.
+/// @return cancellation flag (reset before returning)
 static int disk_thread_chk_cancel_and_cleanup (int f_idx) {
   if (! disk_cancel_flag) return 0;
   else {
@@ -385,6 +385,8 @@ static int disk_thread_chk_cancel_and_cleanup (int f_idx) {
   }
 }
 
+
+/// Fills @c jbuf with fragments from the various segments mapped to the transport timeline.
 static void *disk_thread (void *dtarg) {
   (void) dtarg;
 
@@ -640,8 +642,8 @@ NL "Usage: " MYNAME " [OPTIONS] [[--at POSn] -i FILEn] ... [LOOP]"
 NL "  or:  " MYNAME " { -h | --help | -? | --version }"
 NL ""
 NL "Options:"
-NL "  --cache SEC     Cache size; default: ~6s for 44.1 kHz stereo"
-NL "  --vol PERC      Soft volume (can be greater than 100%)"
+NL "  --cache SEC  Cache size; default: ~6s for 44.1 kHz stereo"
+NL "  --vol PERC   Soft volume (can be greater than 100%)"
 NL ""
 NL "Final LOOP option: [--at LPOS] --loop T0"
 NL "  Repeats the T0-END segment from LPOS to infinity (where END is the"

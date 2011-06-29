@@ -494,6 +494,39 @@ static void create_disk_thread () {
   ENSURE_SYSCALL (pthread_sigmask, (SIG_SETMASK, &oldmask, NULL));
 }
 
+static int sox_convert (const char **fname) {
+  const char mp3ext [] = ".mp3", flacext [] = "-file2jack.flac";
+  const char *oldname = *fname;
+  ASSERT (NULL != oldname);
+  size_t l = strlen (oldname), lbase = l - strlen (mp3ext);
+  if (l < strlen (mp3ext) || 0 != strcasecmp (mp3ext, oldname + lbase))
+    return 0;
+
+  *fname = "";  // for safety  -- temp file will be removed
+  char *newname = malloc (lbase + strlen (flacext));
+  strncpy (newname, oldname, lbase);
+  strcpy (newname + lbase, flacext);
+  const char cmd [] = "sox --no-clobber";
+  char *cmd2 = malloc (strlen ("rate XXXXXX"));
+  sprintf (cmd2, "rate %d", srate);
+  size_t cmdline_sz = strlen (cmd) + l + strlen (newname) + strlen (cmd2) +
+    4 /* delims */ + 4 /* quotes */;
+  char *cmdline = malloc (cmdline_sz);
+  int rc;
+  // this may file in many ways...
+  rc = snprintf (cmdline, cmdline_sz, "%s \"%s\" \"%s\" %s", cmd, oldname, newname, cmd2);
+  TRACE (TRACE_INT, "Executing %s", cmdline);
+  ASSERT (rc > 0 && (size_t) rc < cmdline_sz);
+  ENSURE_SYSCALL_AND_SAVE (system, (cmdline), rc);
+  if (rc != 0) {
+    TRACE (TRACE_FATAL, "Could not execute sox for mp3 file %s", oldname);
+    myshutdown (1);
+  }
+  free (cmdline); free (cmd2);
+  *fname = newname;
+  return 1;
+}
+
 static void setup_input_files () {
   ASSERT (nfiles > 0);
   infile_vio = malloc ((1 + nfiles) * sizeof (infile_vio [0]));
@@ -504,7 +537,10 @@ static void setup_input_files () {
     ftpos [i + 1] = 0;
 
     if (NULL != fname [i]) {
+      int f_is_tmp = sox_convert (&fname [i]);
       ENSURE_SYSCALL_AND_SAVE (open, (fname [i], O_RDONLY), infile_vio [i].fd);
+      if (f_is_tmp) ENSURE_SYSCALL (unlink, (fname [i]));
+
       {
         struct stat buf;
         ENSURE_SYSCALL (fstat, (infile_vio [i].fd, &buf));
@@ -517,9 +553,15 @@ static void setup_input_files () {
                fname [i], sf_strerror (NULL));
         myshutdown (1);
       }
-      if (srate == 0) srate = sf_info.samplerate;
-      else if (srate != (unsigned) sf_info.samplerate) {
-        TRACE (TRACE_FATAL, "File %s has sample rate %d != %d for previous files",
+      if (srate == 0) {
+        jack_nframes_t fsrate = sf_info.samplerate;
+        if (fsrate != srate) {
+          TRACE (TRACE_FATAL, "Jack sample rate %d does not match input files (%d)",
+                 srate, fsrate);
+          myshutdown (1);
+        }
+      } else if (srate != (unsigned) sf_info.samplerate) {
+        TRACE (TRACE_FATAL, "File %s has sample rate=%d different from jack=%d",
                fname [i], sf_info.samplerate, srate);
         myshutdown (1);
       }
@@ -583,8 +625,8 @@ static void compute_frames () {
   jbuf_free_max = 2 * (jbuf_frags - 1);  // One frag wasted due to sentinel byte...
 }
 
-static void setup_audio () {
-  TRACE (TRACE_DIAG, "jack setup");
+static void connect_jack () {
+  TRACE (TRACE_DIAG, "connecting to jack");
   trace_flush (); fflush(NULL);
 
   jack_options_t jopt = JackNullOption;  // JackNoStartServer;
@@ -592,12 +634,13 @@ static void setup_audio () {
   ENSURE_CALL_AND_SAVE (jack_client_open, (MYNAME, jopt, &jstat), jclient, NULL);
   jack_on_shutdown (jclient, on_jack_shutdown, NULL);
 
-  jack_nframes_t jsrate = jack_get_sample_rate (jclient);
-  if (jsrate != srate) {
-    TRACE (TRACE_FATAL, "Jack sample rate %d does not match input files (%d)",
-           jsrate, srate);
-    myshutdown (1);
-  }
+  srate = jack_get_sample_rate (jclient);
+}
+
+static void setup_audio () {
+  TRACE (TRACE_DIAG, "audio setup");
+  trace_flush (); fflush(NULL);
+
   compute_frames ();
 
   ENSURE_SYSCALL (sem_init, (&jbuf_free_sem_store, 0, jbuf_free_max));
@@ -807,6 +850,10 @@ int main (int argc, char **argv) {
 
   ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
   ENSURE_SYSCALL (pthread_create, (&poll_thread_tid, NULL, poll_thread, NULL));
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
+
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
+  connect_jack ();
   ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
 
   setup_input_files ();

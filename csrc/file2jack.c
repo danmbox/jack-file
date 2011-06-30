@@ -418,6 +418,7 @@ restart: (void) 0;
   ENSURE_SYSCALL (pthread_mutex_unlock, (&reloc_lock));
 
   int f_idx;
+  int seek_completed = 0;
   f_idx = frame2file (&offset);
   TRACE (TRACE_INT, "disk thread restart, seg=%d, offset=%lld", f_idx, offset);
 
@@ -440,45 +441,39 @@ restart: (void) 0;
          toread -= read_frames, wptr += read_frames * nports)
     {
       int seg_done = 0;
-      if (infile [f_idx] != NULL) {  // file segment
-        if (offset != JACK_MAX_FRAMES) {
+      sf_count_t avail = JACK_MAX_FRAMES;  // frames left in this segment
+      if (JACK_MAX_FRAMES != ftpos [f_idx + 1])
+        avail = ftpos [f_idx + 1] - ftpos [f_idx] - offset;
+      sf_count_t req_frames = MIN (toread, avail);  // how many frames to request
+      if (infile [f_idx] != NULL) {  // this is a file segment
+        if (! seek_completed) {
           read_frames = sf_seek (infile [f_idx], offset, SEEK_SET);
           if (disk_thread_chk_cancel_and_cleanup (f_idx)) goto restart;
           TRACE (TRACE_INT, "seek=%lld frames, ret=%lld", offset, read_frames);
           ASSERT (read_frames == offset);
-          offset = JACK_MAX_FRAMES;
+          seek_completed = 1;
         }
         TRACE (TRACE_INT + 2, "toread=%lld frames", toread);
-        read_frames = sf_readf_float (infile [f_idx], wptr, toread);
+        read_frames = sf_readf_float (infile [f_idx], wptr, req_frames);
         if (disk_thread_chk_cancel_and_cleanup (f_idx)) goto restart;
-        if (read_frames < toread) {
-          TRACE (TRACE_INT, "Assuming end of seg, got %lld/%lld frames", read_frames, toread);
-          seg_done = 1;
-        }
-      } else {
-        sf_count_t avail = JACK_MAX_FRAMES;
-        if (JACK_MAX_FRAMES != ftpos [f_idx + 1])
-          avail = ftpos [f_idx + 1] - ftpos [f_idx] - offset;
-        if (avail > toread) {
-          read_frames = toread;
-          offset += read_frames;
-        } else {
-          read_frames = avail;
-          seg_done = 1;
-        }
+        ASSERT (read_frames == req_frames);
+      } else {  // this is a silence segment
+        read_frames = req_frames;
         memset (wptr, 0, read_frames * nports * sizeof (sample_t));
       }
+      offset += read_frames;
+      if (read_frames == avail)
+        seg_done = 1;
 
       if (seg_done) {
         TRACE (TRACE_INT, "finished seg=%d", f_idx);
-        ++f_idx;
-        offset = 0;
-      }
-      if (f_idx == (nfiles - 1) && JACK_MAX_FRAMES != loop_start_frame) {
-        // last segment is configured to start at loop_pos_frame
-        offset += ftpos [f_idx];
-        f_idx = frame2file (&offset);
-        TRACE (TRACE_DIAG, "Looping to seg=%d, offset=%lld", f_idx, offset);
+        ++f_idx; seek_completed = 0; offset = 0;
+        if (f_idx == (nfiles - 1) && JACK_MAX_FRAMES != loop_start_frame) {
+          // last segment is configured to start at loop_pos_frame
+          offset += ftpos [f_idx];
+          f_idx = frame2file (&offset);
+          TRACE (TRACE_DIAG, "Looping to seg=%d, offset=%lld", f_idx, offset);
+        }
       }
     }
     TRACE (TRACE_INT + 1, "frag read");
@@ -613,8 +608,11 @@ static void setup_input_files () {
     if (0 != strcmp (ftpos_str [i], ":"))
       ENSURE_CALL (convert_time, (ftpos_str [i], srate, &ftpos [i]) == 0);
     ftpos [i + 1] += ftpos [i];
+    if (NULL == fname [i - 1] && ftpos [i] < ftpos [i - 1])
+      ftpos [i - 1] = ftpos [i];  // move previous implicit silence segment
     TRACE (TRACE_INT, "| %s @%u",
            fname [i] == NULL ? "*" : fname [i], ftpos [i]);
+    ASSERT (0 == i || ftpos [i] >= ftpos [i - 1]);
   }
 
   fname [nfiles] = NULL;

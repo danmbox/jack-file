@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <limits.h>
+#include <ctype.h>
 #include <string.h>
 #include <strings.h>
 
@@ -14,6 +15,7 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <signal.h>
@@ -494,37 +496,65 @@ static void create_disk_thread () {
   ENSURE_SYSCALL (pthread_sigmask, (SIG_SETMASK, &oldmask, NULL));
 }
 
-static int sox_convert (const char **fname) {
-  const char mp3ext [] = ".mp3", flacext [] = "-file2jack.flac";
-  const char *oldname = *fname;
-  ASSERT (NULL != oldname);
-  size_t l = strlen (oldname), lbase = l - strlen (mp3ext);
-  if (l < strlen (mp3ext) || 0 != strcasecmp (mp3ext, oldname + lbase))
-    return 0;
+static int mysystem (const char *argv [], int stdfd [3]) {
+  ASSERT (NULL != argv [0]);
+  pid_t pid = fork ();
+  if (pid != 0) {  // parent
+    ASSERT (pid != (pid_t) -1)
+    int stat_val;
+    ENSURE_SYSCALL (waitpid, (pid, &stat_val, 0));
+    ASSERT (WIFEXITED (stat_val));
+    return WEXITSTATUS (stat_val);
+  } else {  // child
+    for (int i = 0; argv [i] != NULL; ++i)  {
+      // for some reason execv*() wants non-const strings -> strdup() all args
+      argv [i] = strdup (argv [i]);
+    }
+    for (int i = 0; i < 3; ++i) {
+      if (stdfd [i] == -1) {
+        close (i);
+      } else if (stdfd [i] != i) {
+        int rc = dup2 (stdfd [i], i);
+        assert (rc != -1);
+        //close (stdfd [i]);
+      }
+    }
+    execvp (argv [0], (char **) argv);
+    printf ("Could not exec %s\n", argv [0]);
+    exit (EXIT_FAILURE);
+  }
+}
 
-  *fname = "";  // for safety  -- temp file will be removed
-  char *newname = malloc (lbase + strlen (flacext));
-  strncpy (newname, oldname, lbase);
-  strcpy (newname + lbase, flacext);
-  const char cmd [] = "sox --no-clobber";
-  char *cmd2 = malloc (strlen ("rate XXXXXX"));
-  sprintf (cmd2, "rate %d", srate);
-  size_t cmdline_sz = strlen (cmd) + l + strlen (newname) + strlen (cmd2) +
-    4 /* delims */ + 4 /* quotes */;
-  char *cmdline = malloc (cmdline_sz);
-  int rc;
-  // this may file in many ways...
-  rc = snprintf (cmdline, cmdline_sz, "%s \"%s\" \"%s\" %s", cmd, oldname, newname, cmd2);
-  TRACE (TRACE_INT, "Executing %s", cmdline);
-  ASSERT (rc > 0 && (size_t) rc < cmdline_sz);
-  ENSURE_SYSCALL_AND_SAVE (system, (cmdline), rc);
-  if (rc != 0) {
-    TRACE (TRACE_FATAL, "Could not execute sox for mp3 file %s", oldname);
+static int sox_convert (int infd, const char *name) {
+  ASSERT (infd >= 0);
+  char *tmpf = strdup ("/tmp/file2jack.XXXXXX");
+  int outfd; ENSURE_SYSCALL_AND_SAVE (mkstemp, (tmpf), outfd);
+  ENSURE_SYSCALL (unlink, (tmpf)); free (tmpf);
+  int stdfd [3] = { infd, outfd, 2 };
+
+  char *ext = strrchr (name, '.'); ASSERT (ext != NULL);
+  ++ext;
+  char *loext = strdup (ext);
+  for (char *p = loext; *p != '\0'; ++p) *p = tolower (*p);
+
+  char ratestr [6 + 1];
+  snprintf (ratestr, sizeof (ratestr), "%d", srate);
+  const char *argv [] = { //"/tmp/printargs",
+    "sox", "-q", "--no-clobber",
+    "-t", loext, "-", "-t", "flac", "-",
+    "rate", ratestr,
+    NULL
+  };
+
+  TRACE (TRACE_INFO, "Calling sox to convert file %s", name);
+  int rc = mysystem (argv, stdfd);
+  close (infd); free (loext);
+  if (rc != EXIT_SUCCESS) {
+    TRACE (TRACE_FATAL, "Could not execute sox (exit=%d)", rc);
     myshutdown (1);
   }
-  free (cmdline); free (cmd2);
-  *fname = newname;
-  return 1;
+
+  return outfd;
 }
 
 static void setup_input_files () {
@@ -537,41 +567,45 @@ static void setup_input_files () {
     ftpos [i + 1] = 0;
 
     if (NULL != fname [i]) {
-      int f_is_tmp = sox_convert (&fname [i]);
+      SF_INFO sf_info;
       ENSURE_SYSCALL_AND_SAVE (open, (fname [i], O_RDONLY), infile_vio [i].fd);
-      if (f_is_tmp) ENSURE_SYSCALL (unlink, (fname [i]));
-
-      {
+      for (int try = 0; try < 2; ++try) {
+        ENSURE_SYSCALL (lseek, (infile_vio [i].fd, 0, SEEK_SET));
         struct stat buf;
         ENSURE_SYSCALL (fstat, (infile_vio [i].fd, &buf));
         infile_vio [i].sz = buf.st_size;
-      }
-      SF_INFO sf_info;
-      infile [i] = open_sf_fd_read (&infile_vio [i], &sf_info);
-      if (NULL == infile [i]) {
-        TRACE (TRACE_FATAL, "Could not open file %s: %s",
-               fname [i], sf_strerror (NULL));
-        myshutdown (1);
-      }
-      if (srate == 0) {
-        jack_nframes_t fsrate = sf_info.samplerate;
-        if (fsrate != srate) {
-          TRACE (TRACE_FATAL, "Jack sample rate %d does not match input files (%d)",
-                 srate, fsrate);
-          myshutdown (1);
+        infile [i] = open_sf_fd_read (&infile_vio [i], &sf_info);
+        if (NULL == infile [i]) {
+          int err = sf_error (NULL);
+          ASSERT (err != SF_ERR_NO_ERROR);
+          if (try == 1 || err == SF_ERR_SYSTEM || err == SF_ERR_MALFORMED_FILE) {
+            TRACE (TRACE_FATAL, "Could not open file %s: %s (%d)",
+                   fname [i], sf_error_number (err), err);
+            myshutdown (1);
+          }
+        } else {  // sf_open() succeeded, check format
+          if (srate == (unsigned) sf_info.samplerate) {
+            if (0 == nports) nports = sf_info.channels;
+            else if (nports != (unsigned) sf_info.channels) {
+              TRACE (TRACE_FATAL, "File %s has # of channels %d != %d for previous files",
+                     fname [i], sf_info.channels, nports);
+              myshutdown (1);
+            }
+            break;
+          } else {
+            sf_close (infile [i]); infile [i] = NULL;
+            ENSURE_SYSCALL (lseek, (infile_vio [i].fd, 0, SEEK_SET));
+          }
         }
-      } else if (srate != (unsigned) sf_info.samplerate) {
-        TRACE (TRACE_FATAL, "File %s has sample rate=%d different from jack=%d",
-               fname [i], sf_info.samplerate, srate);
-        myshutdown (1);
-      }
-      if (0 == nports) nports = sf_info.channels;
-      else if (nports != (unsigned) sf_info.channels) {
-        TRACE (TRACE_FATAL, "File %s has # of channels %d != %d for previous files",
-               fname [i], sf_info.channels, nports);
-        myshutdown (1);
+
+        if (try == 0)
+          infile_vio [i].fd = sox_convert (infile_vio [i].fd, fname [i]);
       }
 
+      if (NULL == infile [i]) {
+        TRACE (TRACE_FATAL, "Conversion failed for file %s", fname [i]);
+        myshutdown (1);
+      }
       ASSERT (1 == nports || 2 == nports);
       ftpos [i + 1] += sf_info.frames;
     }

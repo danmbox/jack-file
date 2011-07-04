@@ -50,12 +50,12 @@
       Jack transport-centric utilities for audio playback
     </div>
 
-<p>Jack-File contains two utilities for Jack transport-bound playback:</p>
-<p>file2jack is a gapless audio player that maps files onto the
+<p>Jack-File contains two utilities for Jack transport-bound
+playback:</p> <p>file2jack is an audio player that maps files onto the
 (optionally periodic) transport timeline. The player achieves
-periodicty (looping) without moving the transport: the looped segments
-are simply mapped to transport time-points. A picture is worth 10^n
-words:</p>
+periodicty (looping) without moving the transport (and thus without
+gaps): the looped segments are simply mapped to transport
+time-points. A picture is worth 10^n words:</p>
 
 <pre>
 |*****| FILE A | FILE B |******| FILE C | FILE C | FILE C | ...
@@ -75,8 +75,8 @@ periodically from 40s to infinity evert 10s.</p>
 players: it forces the Jack transport to loop between two time-points.
 When the transport reaches the loop endpoint, it is forced back to the
 starting point. This will loop any transport-aware player, but
-compared to file2jack it will create playback a gap at the loop
-endpoint.</p>
+compared to file2jack it will create playback a gap at the end of the
+loop.</p>
 
 <p>See README.txt in the distribution for more information.</p>
 
@@ -84,8 +84,7 @@ endpoint.</p>
 <a href="https://github.com/danmbox/shut-audio-tools/issues">Apache License, Version 2.0</a>
       
 <h2>Authors</h2>
-<p>Dan A. Muresan (danmbox@gmail.com)</p>
-
+<p><a href="http://alumnus.caltech.edu/~muresan/">Dan A. Muresan</a> (danmbox at gmail dot com)</p>
 
     <h2>Download</h2>
     <p>

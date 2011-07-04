@@ -51,7 +51,7 @@ man/%.1: % $(filter-out $(wildcard man), man) Makefile
 install: all installdirs
 	$(INSTALL_PROGRAM) $(PROGS) $(DESTDIR)$(bindir)
 	$(INSTALL_DATA) $(MANS) $(DESTDIR)$(man1dir)
-	$(INSTALL_DATA) $(DESKTOPS) $(DESTDIR)$(datadir)/applications
+#	$(INSTALL_DATA) $(DESKTOPS) $(DESTDIR)$(datadir)/applications
 
 clean:
 	set -f; for pat in $(TMP_WILD); do find . -iname $$pat -exec rm {} \; ; done; \

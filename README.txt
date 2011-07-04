@@ -54,7 +54,7 @@ PATH="$PATH":/opt/jack-file
 
 # for packagers:
 make DESTDIR=build/ prefix=/usr install
-cd build; tar cvzf ../jack-file.tar.gz
+cd build; tar cvzf ../jack-file.tar.gz .
 
 
 4. RUNNING

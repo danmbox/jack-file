@@ -45,6 +45,7 @@ typedef struct {
 
 // configurable params
 int afterlife = 0;  ///< don't quit after Jack kills us
+int stop_io = 1;  ///< return short count when I/O is cancelled?
 int jbuf_frags = 0;  ///< Fragments / cache
 float cache_secs = 0.0;
 float soft_vol = 100.0;
@@ -297,7 +298,7 @@ static sf_count_t mysf_vio_rw (void *ptr, sf_count_t count, mysf_vio_data *data,
   int rc;
 
   while (done < count) {
-    if (disk_cancel_flag) {
+    if (disk_cancel_flag && stop_io) {
       TRACE (TRACE_INT + 1, "IO cancelled, returning short count");
       return 0;  // cause decoder to exit ASAP
 #if 0  // fake a successful read; still causes un-clearable decoder errors

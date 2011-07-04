@@ -37,7 +37,8 @@ endpoint.
 
 2. DEPENDENCIES:
 
-* jack, sndfile; sox (optional)
+* jack, sndfile; sox (optional -- for formats not supported by
+  sndfile, like mp3)
 
 * build dependencies: GNU make, pkg-config, help2man
 

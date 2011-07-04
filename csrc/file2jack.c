@@ -492,6 +492,8 @@ static void create_disk_thread () {
   ENSURE_SYSCALL (pthread_sigmask, (SIG_SETMASK, &oldmask, NULL));
 }
 
+/// Executes the command given in @p argv with the specified stdin, stdout, stderr.
+/// Any @p stdfd given as -1 will be closed.
 static int mysystem (const char *argv [], int stdfd [3]) {
   ASSERT (NULL != argv [0]);
   pid_t pid = fork ();
@@ -521,6 +523,9 @@ static int mysystem (const char *argv [], int stdfd [3]) {
   }
 }
 
+/// Calls sox to convert the @p infd input filedes to FLAC.
+/// The file @p name is only for debugging purposes.
+/// @return filedes of converted file (temporary -- unlinked but kept open)
 static int sox_convert (int infd, const char *name) {
   ASSERT (infd >= 0);
   char *tmpf = strdup ("/tmp/file2jack.XXXXXX");
@@ -630,11 +635,10 @@ static void on_jack_shutdown (void *arg) {
   int z = 0;
   if (0 == sem_getvalue (&zombified, &z) && z == 0) {
     sem_post (&zombified);
-    // TODO: Wake up get_jsample(). It will test zombified and realize there's no
-    // extra sample.
   }
 }
 
+/// Converts sizes, positions from secs to frames
 static void compute_frames () {
   jperiodframes = jack_get_buffer_size (jclient);
   if (cache_secs > 0) jbuf_len = nports * srate * cache_secs + 0.5;
@@ -886,7 +890,7 @@ int main (int argc, char **argv) {
   ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
 
   ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
-  connect_jack ();
+  connect_jack ();  // we need the sampling rate
   ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
 
   setup_input_files ();

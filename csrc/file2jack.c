@@ -789,6 +789,8 @@ static void parse_args (char **argv) {
       }
     }
   }
+  if (nfiles == 0)
+    usage ("Wrong arguments");
   ftpos_str [nfiles] = ":"; fname [nfiles++] = NULL;
   if (loop_start_str != NULL) {
     ftpos_str [nfiles] = loop_pos_str; fname [nfiles++] = NULL;

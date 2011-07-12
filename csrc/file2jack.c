@@ -228,6 +228,8 @@ static void *process_thread (void *arg) {
       clear_port_bufs (jportbuf, nframes);
     } else if (jdata == NULL) {
       TRACE (TRACE_WARN, "Underrun");
+      // TODO: track under-runs, subtract from next period.
+      // Otherwise we lose sync with transport
       clear_port_bufs (jportbuf, nframes);
     } else {
       // un-interleave samples
@@ -404,6 +406,9 @@ static void *disk_thread (void *dtarg) {
 
 restart: (void) 0;
   jack_ringbuffer_reset (jbuf);
+
+  // reset semaphores; we could destroy & re-create, but that would
+  // introduce more syncing issues
   int semval;
   ENSURE_SYSCALL (sem_getvalue, (jbuf_free_sem, &semval));
   for (; semval < jbuf_free_max; ++semval)
@@ -412,7 +417,7 @@ restart: (void) 0;
   for (; semval > 0; --semval)
     sem_wait (jbuf_used_sem);
 
-  sf_count_t offset;
+  sf_count_t offset;  // offset in current segment (!= the transport location)
 
   ENSURE_SYSCALL (pthread_mutex_lock, (&reloc_lock));
   disk_cancel_flag = 0;
@@ -883,7 +888,7 @@ int main (int argc, char **argv) {
       ! setup_sigs (sig_handler, &sigusr2_mask, 0, 1, SIGUSR2))
   {
     TRACE_PERROR (TRACE_FATAL, "signal setup");
-    return 1;
+    return EXIT_FAILURE;
   }
   ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigusr2_mask, NULL));
 
@@ -894,7 +899,7 @@ int main (int argc, char **argv) {
   ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
 
   ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
-  connect_jack ();  // we need the sampling rate
+  connect_jack ();  // we need the sampling rate before anything else
   ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
 
   setup_input_files ();
@@ -907,6 +912,10 @@ int main (int argc, char **argv) {
 
   myshutdown (0); assert (0);
 }
+
+// Current design relies on sem_wait providing a read barrier, and sem_post
+// providing a write barrier. If this is not true, we could also provide
+// per-fragment locks, which would "normally" be uncontended.
 
 // Local Variables:
 // write-file-functions: (lambda () (delete-trailing-whitespace) nil)

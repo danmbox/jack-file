@@ -62,12 +62,12 @@ int cleaned_up = 0;
 unsigned nports = 0;  ///< Number of output ports
 jack_port_t **jport = NULL;  ///< Jack audio ports
 jack_ringbuffer_t *jbuf = NULL;  ///< Outgoing audio buffer
-/// Counting semaphore for free space in @c jbuf (in HALF-fragments).
-/// We use 1/2s so we can wait for the semaphore (in the disk thread)
-/// before storing the actual data; when the transfer completes, we signal
-/// the remaining 1/2. This works because the process thread ignores 1/2s.
+/// Counting semaphore for free space in @c jbuf (in fragments).
 sem_t *jbuf_free_sem = NULL;
 sem_t jbuf_free_sem_store;  // Actual semaphore for above, invalid initially
+/// Counting semaphore for available fragments in @c jbuf
+sem_t *jbuf_used_sem = NULL;
+sem_t jbuf_used_sem_store;  // Actual semaphore for above, invalid initially
 int jbuf_free_max = -1;  ///< Max (and initial) value for @c jbuf_free_sem
 /// Size of @c jbuf in samples (NOT frames).
 jack_nframes_t jbuf_len = 0;
@@ -116,9 +116,9 @@ jack_nframes_t post_relocation (jack_nframes_t frame) {
       if (reloc_pending) player_ready = 0;
       else {
         int semval2;
-        ENSURE_SYSCALL (sem_getvalue, (jbuf_free_sem, &semval2));
+        ENSURE_SYSCALL (sem_getvalue, (jbuf_used_sem, &semval2));
         // start when 1 fragment is ready
-        player_ready = ((float) ((jbuf_free_max - semval2) / 2)) >= 1;
+        player_ready = semval2 >= 1;
         if (player_ready) reloc_frame = JACK_MAX_FRAMES;
       }
       ENSURE_SYSCALL (pthread_mutex_unlock, (&reloc_lock));
@@ -197,17 +197,16 @@ static void *process_thread (void *arg) {
     if (jdatalen == 0 && player_ready) {
       if (jdata != NULL) {
         jack_ringbuffer_read_advance (jbuf, frag_frames * nports * sizeof (sample_t));
-        for (int i = 0; i < 2; i++)
-          ENSURE_SYSCALL (sem_post, (jbuf_free_sem));
+        ENSURE_SYSCALL (sem_post, (jbuf_free_sem));
         jdata = NULL;
       }
-      int semval;
-      ENSURE_SYSCALL (sem_getvalue, (jbuf_free_sem, &semval));
-      if (semval <= jbuf_free_max - 2) {  // don't count on half-fragments
+      int rc;
+      while (0 != (rc = sem_trywait (jbuf_used_sem)))
+        if (EAGAIN == errno) break;
+        else ASSERT (EINTR == errno);
+      if (rc == 0) {
         jack_ringbuffer_data_t jdatainfo [2];
         jack_ringbuffer_get_read_vector (jbuf, jdatainfo);
-        jdatalen = jdatainfo [0].len / sizeof (sample_t) / nports;
-        ASSERT (jdatalen >= frag_frames);
         jdatalen = frag_frames;
         jdata = (sample_t *) jdatainfo [0].buf;
       }
@@ -409,6 +408,9 @@ restart: (void) 0;
   ENSURE_SYSCALL (sem_getvalue, (jbuf_free_sem, &semval));
   for (; semval < jbuf_free_max; ++semval)
     sem_post (jbuf_free_sem);
+  ENSURE_SYSCALL (sem_getvalue, (jbuf_used_sem, &semval));
+  for (; semval > 0; --semval)
+    sem_wait (jbuf_used_sem);
 
   sf_count_t offset;
 
@@ -425,17 +427,14 @@ restart: (void) 0;
 
   for (;;) {
     // wait on semaphore, possibly cancelling on EINTR
-    // this frees up a half-fragment -- we free the other @ the end
     int rc;
-    while ((rc = sem_wait (jbuf_free_sem)) == -1) {
+    while (-1 == (rc = sem_wait (jbuf_free_sem))) {
       ASSERT (EINTR == errno);
       if (disk_cancel_flag) goto restart;
-      else continue;
     }
     TRACE (TRACE_INT + 2, "start frag");
     jack_ringbuffer_data_t jdatainfo [2];
     jack_ringbuffer_get_write_vector (jbuf, jdatainfo);
-    ASSERT (jdatainfo [0].len / sizeof (sample_t) / nports >= frag_frames);
     sample_t *wptr = (sample_t *) jdatainfo [0].buf;
     sf_count_t read_frames = 0;
     for (sf_count_t toread = frag_frames; toread > 0;
@@ -479,7 +478,7 @@ restart: (void) 0;
     }
     TRACE (TRACE_INT + 1, "frag read");
     jack_ringbuffer_write_advance (jbuf, frag_frames * nports * sizeof (sample_t));
-    ENSURE_SYSCALL (sem_wait, (jbuf_free_sem));  // now mark the other half as free
+    ENSURE_SYSCALL (sem_post, (jbuf_used_sem));  // data is ready
   }
 
   return NULL;
@@ -659,7 +658,7 @@ static void compute_frames () {
     jbuf_len = ((jbuf_len - 1) / denom + 1) * denom;
   }
   frag_frames = jbuf_len / (jbuf_frags * nports);
-  jbuf_free_max = 2 * (jbuf_frags - 1);  // One frag wasted due to sentinel byte...
+  jbuf_free_max = jbuf_frags - 1;  // One frag wasted due to sentinel byte...
 }
 
 static void connect_jack () {
@@ -682,6 +681,8 @@ static void setup_audio () {
 
   ENSURE_SYSCALL (sem_init, (&jbuf_free_sem_store, 0, jbuf_free_max));
   jbuf_free_sem = &jbuf_free_sem_store;
+  ENSURE_SYSCALL (sem_init, (&jbuf_used_sem_store, 0, 0));
+  jbuf_used_sem = &jbuf_used_sem_store;
 
   TRACE (TRACE_INFO, "Connected to jack, period=%d, rate=%d, ports=%d, cache=%.3f sec (%d samples), %d fragments of %d frames",
          (int) jperiodframes, (int) srate, nports, (float) jbuf_len / (srate * nports), jbuf_len, jbuf_frags, frag_frames);

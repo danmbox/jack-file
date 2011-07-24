@@ -90,8 +90,6 @@ SNDFILE **infile = NULL;
 jack_nframes_t *ftpos = NULL;  ///< Position of files on transport timeline
 jack_nframes_t loop_start_frame = JACK_MAX_FRAMES;
 const char *loop_start_str = NULL;
-unsigned loop_start_file = -1;
-pthread_mutex_t files_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
 // --- PROGRAM ---

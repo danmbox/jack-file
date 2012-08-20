@@ -43,7 +43,7 @@ CLEAN_FILES := $(MANS) $(PROGS)
 all: $(PROGS) $(MANS)
 
 %: csrc/%.c $(wildcard csrc/*.h) Makefile
-	$(CC) $(CFLAGS) -std=c99 -D_REENTRANT $(LDFLAGS) -lm -lpthread -lrt $< -o $@
+	$(CC) $(CFLAGS) -std=c99 -D_REENTRANT $< -lm -lpthread -lrt $(LDFLAGS) -o $@
 
 man/%.1: % $(filter-out $(wildcard man), man) Makefile
 	help2man -N -o $@ $(abspath $<) || { $< --help || :; $< --version || :; false; }

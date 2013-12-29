@@ -275,22 +275,6 @@ sf_count_t  mysf_vio_seek (sf_count_t offset, int whence, void *user_data) {
 
 typedef ssize_t (*io_syscall) (int, void *, size_t);
 
-#if 0
-static int test_disk_cancel_sem () {
-  TRACE (TRACE_INT + 3, "testing IO cancellation");
-  for (;;) {  // test for cancelled I/O
-    int rc = sem_trywait (&disk_cancel_sem);
-    if (rc == -1) {
-      if (EINTR == errno) continue;
-      ASSERT (EAGAIN == errno);
-      return 0;
-    } else {
-      return (disk_cancel_flag = 1);
-    }
-  }
-}
-#endif
-
 static sf_count_t mysf_vio_rw (void *ptr, sf_count_t count, mysf_vio_data *data, io_syscall io) {
   sf_count_t done = 0;
   int rc;

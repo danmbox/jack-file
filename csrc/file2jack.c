@@ -57,8 +57,7 @@ pthread_t main_tid;
 pthread_t disk_thread_tid [1];
 jack_nframes_t srate = 0;  ///< Sampling rate
 jack_client_t *jclient = NULL;
-sem_t zombified;
-int cleaned_up = 0;
+int zombified;  // use with GCC atomic builtins
 unsigned nports = 0;  ///< Number of output ports
 jack_port_t **jport = NULL;  ///< Jack audio ports
 jack_ringbuffer_t *jbuf = NULL;  ///< Outgoing audio buffer
@@ -634,10 +633,7 @@ static void setup_input_files () {
 static void on_jack_shutdown (void *arg) {
   (void) arg;
 
-  int z = 0;
-  if (0 == sem_getvalue (&zombified, &z) && z == 0) {
-    sem_post (&zombified);
-  }
+  __sync_fetch_and_add (&zombified, 1);
 }
 
 /// Converts sizes, positions from secs to frames
@@ -810,20 +806,17 @@ static void init_trace () {
 }
 
 static void cleanup () {
-  int z = 0;
-  if (0 == sem_getvalue (&zombified, &z) && z > 0)
+  if (__sync_fetch_and_add (&zombified, 1) > 0)
     TRACE (TRACE_FATAL, "Jack shut us down");
   pthread_cancel_and_join_if_started (poll_thread_tid, main_tid);
   pthread_cancel_and_join_if_started (disk_thread_tid [0], main_tid);
   if (jclient != NULL) {
-    if (z == 0) sem_post (&zombified);  // main already knows about it, signal others
     jack_client_close (jclient);
     jclient = NULL;
   }
 
   TRACE (TRACE_INFO, "Cleanup finished");
   trace_flush ();
-  cleaned_up = 1;
 }
 
 // pitfall: name clash with shutdown(2)
@@ -872,7 +865,6 @@ static void init_globals () {
   disk_thread_tid [0] = main_tid;
   ENSURE_SYSCALL (sigemptyset, (&sigmask));
   ENSURE_SYSCALL (sigemptyset, (&sigusr2_mask));
-  ENSURE_SYSCALL (sem_init, (&zombified, 0, 0));
 }
 
 int main (int argc, char **argv) {

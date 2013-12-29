@@ -259,7 +259,7 @@ static void *poll_thread (void *arg) {
   return NULL;
 }
 
-/// Flag set by virtual I/O functions
+/// Flag set by sighandlers and checked by virtual I/O functions
 volatile sig_atomic_t disk_cancel_flag = 0;
 
 sf_count_t  mysf_vio_get_filelen (void *user_data) {
@@ -889,7 +889,7 @@ int main (int argc, char **argv) {
 
 // Current design relies on sem_wait providing a read barrier, and sem_post
 // providing a write barrier. If this is not true, we could also provide
-// per-fragment locks, which would "normally" be uncontended.
+// per-fragment locks, which would "normally" be uncontended, or barriers.
 
 // Local Variables:
 // write-file-functions: (lambda () (delete-trailing-whitespace) nil)

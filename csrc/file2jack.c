@@ -51,7 +51,8 @@ float cache_secs = 0.0;
 float soft_vol = 100.0;
 
 // internal vars
-sigset_t sigmask, sigusr2_mask;
+sigset_t sigint_mask,  ///< external INT, TERM & resumable condition signals
+  sigusr2_mask;        ///< just SIGUSR2
 pthread_t poll_thread_tid;
 pthread_t main_tid;
 pthread_t disk_thread_tid [1];
@@ -472,7 +473,7 @@ restart: (void) 0;
 
 static void create_disk_thread () {
   sigset_t oldmask;
-  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, &oldmask));
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigint_mask, &oldmask));
   ENSURE_SYSCALL (pthread_create, (&disk_thread_tid [0], NULL, disk_thread, NULL));
   ENSURE_SYSCALL (pthread_sigmask, (SIG_SETMASK, &oldmask, NULL));
 }
@@ -807,9 +808,9 @@ static void cleanup () {
 static void myshutdown (int failure) {
   TRACE (TRACE_INFO, "shutdown requested");
   // print_backtrace ();
-  pthread_sigmask (SIG_BLOCK, &sigmask, NULL);
+  pthread_sigmask (SIG_BLOCK, &sigint_mask, NULL);
   cleanup ();
-  pthread_sigmask (SIG_UNBLOCK, &sigmask, NULL);
+  pthread_sigmask (SIG_UNBLOCK, &sigint_mask, NULL);
   if (afterlife) pause ();
   switch (failure) {
   case 0: case 1: exit (failure ? EXIT_FAILURE : EXIT_SUCCESS);
@@ -834,10 +835,12 @@ static void sig_handler (int sig) {
   if (sig == SIGPIPE) return;  // we don't do pipes
   TRACE (TRACE_INFO, "Caught signal %d", sig);
   cleanup ();
+
+  // disable custom handler and re-send signal to self
   struct sigaction act =
-    { .sa_mask = sigmask, .sa_flags = 0, .sa_handler = SIG_DFL };
+    { .sa_mask = sigint_mask, .sa_flags = 0, .sa_handler = SIG_DFL };
   sigaction (sig, &act, NULL);
-  pthread_sigmask (SIG_UNBLOCK, &sigmask, NULL);
+  pthread_sigmask (SIG_UNBLOCK, &sigint_mask, NULL);
   ENSURE_SYSCALL (pthread_kill, (pthread_self (), sig));
 }
 
@@ -847,7 +850,7 @@ static void init_globals () {
   main_tid = pthread_self ();
   poll_thread_tid = main_tid;
   disk_thread_tid [0] = main_tid;
-  ENSURE_SYSCALL (sigemptyset, (&sigmask));
+  ENSURE_SYSCALL (sigemptyset, (&sigint_mask));
   ENSURE_SYSCALL (sigemptyset, (&sigusr2_mask));
 }
 
@@ -858,7 +861,7 @@ int main (int argc, char **argv) {
 
   init_globals ();
 
-  if (! setup_sigs (sig_handler, &sigmask, SA_RESTART, 7, SIGTERM, SIGQUIT, SIGABRT, SIGPIPE, SIGFPE, SIGINT, SIGALRM) ||
+  if (! setup_sigs (sig_handler, &sigint_mask, SA_RESTART, 8, SIGTERM, SIGQUIT, SIGABRT, SIGPIPE, SIGFPE, SIGINT, SIGHUP, SIGALRM) ||
       ! setup_sigs (sig_handler, &sigusr2_mask, 0, 1, SIGUSR2))
   {
     TRACE_PERROR (TRACE_FATAL, "signal setup");
@@ -868,19 +871,19 @@ int main (int argc, char **argv) {
 
   parse_args (argv);
 
-  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigint_mask, NULL));
   ENSURE_SYSCALL (pthread_create, (&poll_thread_tid, NULL, poll_thread, NULL));
-  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigint_mask, NULL));
 
-  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigint_mask, NULL));
   connect_jack ();  // we need the sampling rate before anything else
-  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigint_mask, NULL));
 
   setup_input_files ();
 
-  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigmask, NULL));
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigint_mask, NULL));
   setup_audio ();
-  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigmask, NULL));
+  ENSURE_SYSCALL (pthread_sigmask, (SIG_UNBLOCK, &sigint_mask, NULL));
 
   for (;;) pause ();
 

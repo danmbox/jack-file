@@ -379,6 +379,8 @@ static void *disk_thread (void *dtarg) {
   {
     sigset_t nonusr2_mask; ENSURE_SYSCALL (sigfillset, (&nonusr2_mask));
     sigdelset (&nonusr2_mask, SIGUSR2);
+    // avoid race conditions: block SIGUSR2, then loop over sigsuspend()
+    // waiting for side-effects of sighandler to materialize
     ENSURE_SYSCALL (pthread_sigmask, (SIG_BLOCK, &sigusr2_mask, NULL));
     while (! disk_cancel_flag)
       sigsuspend (&nonusr2_mask);
